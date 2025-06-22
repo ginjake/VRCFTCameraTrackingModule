@@ -9,17 +9,23 @@
 	<!-- 必要に応じてランタイム識別子も指定 -->
 	<RuntimeIdentifier>win-x64</RuntimeIdentifier>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="KeyJawTrackingModule.cs" />
+  </ItemGroup>
   <ItemGroup>
     <None Remove="Assets\alvr.png" />
   </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\VRCFaceTracking\VRCFaceTracking.Core\VRCFaceTracking.Core.csproj" />
-  </ItemGroup>
-
   <ItemGroup>
     <EmbeddedResource Include="Assets\alvr.png">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </EmbeddedResource>
   </ItemGroup>
+  <ItemGroup>
+    <None Include="KeyJawTrackingModule.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\varjo\VRCFaceTracking\VRCFaceTracking.Core\VRCFaceTracking.Core.csproj" />
+  </ItemGroup>
+
 </Project>

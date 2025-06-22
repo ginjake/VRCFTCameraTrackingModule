@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+	<!-- 常に x64 （AMD64）でビルドする -->
+	<RuntimeIdentifier>win-x64</RuntimeIdentifier>
+	<!-- ライブラリプロジェクトでもネイティブをコピー -->
+	<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+	  
+  </PropertyGroup>
+  <ItemGroup>
+    <None Remove="Assets\alvr.png" />
+  </ItemGroup>
+
+
+  <ItemGroup>
+    <EmbeddedResource Include="TrackingLibs\OpenCvSharp.dll" />
+  </ItemGroup>
+  
+  <ItemGroup>
+    <ProjectReference Include="..\VRCFaceTracking\VRCFaceTracking.Core\VRCFaceTracking.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\alvr.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </EmbeddedResource>
+  </ItemGroup>
+
+
+	<ItemGroup>
+		<!-- マネージドDLL -->
+		<PackageReference Include="DlibDotNet" Version="19.21.0.20220724" />
+		<PackageReference Include="DlibDotNet.Extensions" Version="19.18.0.20200428" />
+		<!-- マネージド側の API (Mat, VideoCapture, etc.) -->
+		<PackageReference Include="OpenCvSharp4" Version="4.9.0.20240103" />
+		<!-- ネイティブランタイム (カメラ, ffmpeg, etc.) -->
+		<PackageReference Include="OpenCvSharp4.runtime.win" Version="4.9.0.20240103" />
+		
+	</ItemGroup>
+	
+	
+	
+
+</Project>
