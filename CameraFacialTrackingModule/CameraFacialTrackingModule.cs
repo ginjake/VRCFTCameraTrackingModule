@@ -11,14 +11,30 @@ namespace CameraFacialTrackingModule
 {
     public class CameraFacialTrackingModule : ExtTrackingModule
     {
-        private float jawA = 0f;
-        private float jawI = 0f;
-        private float jawU = 0f;
-        private float jawE = 0f;
-        private float jawO = 0f;
+        // パラメータ受信用
+        private readonly float[] values = new float[14];
 
         private UdpClient udp;
         private IPEndPoint ep;
+
+        // 対応表情の順番を定義
+        private static readonly string[] ParamKeys = new[]
+        {
+            "JawOpen",
+            "JawRight",
+            "JawLeft",
+            "JawForward",
+            "MouthCornerPullRight",
+            "MouthCornerPullLeft",
+            "MouthPucker",
+            "CheekPuffRight",
+            "CheekPuffLeft",
+            "TongueOut",
+            "TongueUp",
+            "TongueDown",
+            "TongueRight",
+            "TongueLeft"
+        };
 
         public override (bool SupportsEye, bool SupportsExpression) Supported => (false, true);
 
@@ -33,11 +49,20 @@ namespace CameraFacialTrackingModule
 
         public override void Update()
         {
-            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawOpen].Weight = jawA;
-            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawClench].Weight = jawI;
-            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawForward].Weight = jawU;
-            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawMandibleRaise].Weight = jawE;
-            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawBackward].Weight = jawO;
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawOpen].Weight = values[0];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawRight].Weight = values[1];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawLeft].Weight = values[2];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawForward].Weight = values[3];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.MouthCornerPullRight].Weight = values[4];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.MouthCornerPullLeft].Weight = values[5];
+//            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.MouthPucker].Weight = values[6];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.CheekPuffRight].Weight = values[7];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.CheekPuffLeft].Weight = values[8];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.TongueOut].Weight = values[9];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.TongueUp].Weight = values[10];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.TongueDown].Weight = values[11];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.TongueRight].Weight = values[12];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.TongueLeft].Weight = values[13];
 
             Thread.Sleep(4);
         }
@@ -64,11 +89,11 @@ namespace CameraFacialTrackingModule
             float? val = ParseOscFloat(bytes);
             if (addr == null || val == null) return;
 
-            if (addr == "/avatar/parameters/Voice_A") jawA = Math.Clamp(val.Value, 0f, 1f);
-            if (addr == "/avatar/parameters/Voice_I") jawI = Math.Clamp(val.Value, 0f, 1f);
-            if (addr == "/avatar/parameters/Voice_U") jawU = Math.Clamp(val.Value, 0f, 1f);
-            if (addr == "/avatar/parameters/Voice_E") jawE = Math.Clamp(val.Value, 0f, 1f);
-            if (addr == "/avatar/parameters/Voice_O") jawO = Math.Clamp(val.Value, 0f, 1f);
+            for (int i = 0; i < ParamKeys.Length; i++)
+            {
+                if (addr == $"/avatar/parameters/{ParamKeys[i]}")
+                    values[i] = Math.Clamp(val.Value, 0f, 1f);
+            }
         }
 
         private string ParseOscAddress(byte[] bytes)
