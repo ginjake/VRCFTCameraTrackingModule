@@ -3,9 +3,9 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.8.34525.116
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "keyboardTest", "keyboardTest\keyboardTest.csproj", "{943B73EF-82BD-4781-86CB-99F4DC046293}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "CameraFacialTrackingModule", "CameraFacialTrackingModule\CameraFacialTrackingModule.csproj", "{943B73EF-82BD-4781-86CB-99F4DC046293}"
 EndProject
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "VRCFaceTracking.Core", "VRCFaceTracking\VRCFaceTracking.Core\VRCFaceTracking.Core.csproj", "{31AC5304-CC50-4B3C-9D0F-1675241B65C5}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "VRCFaceTracking.Core", "VRCFaceTracking\VRCFaceTracking.Core\VRCFaceTracking.Core.csproj", "{F88A3C7F-A3D4-4F80-896E-1959A6000A98}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -23,14 +23,14 @@ Global
 		{943B73EF-82BD-4781-86CB-99F4DC046293}.Release|Any CPU.Build.0 = Release|Any CPU
 		{943B73EF-82BD-4781-86CB-99F4DC046293}.Release|x64.ActiveCfg = Release|Any CPU
 		{943B73EF-82BD-4781-86CB-99F4DC046293}.Release|x64.Build.0 = Release|Any CPU
-		{31AC5304-CC50-4B3C-9D0F-1675241B65C5}.Debug|Any CPU.ActiveCfg = Debug|x64
-		{31AC5304-CC50-4B3C-9D0F-1675241B65C5}.Debug|Any CPU.Build.0 = Debug|x64
-		{31AC5304-CC50-4B3C-9D0F-1675241B65C5}.Debug|x64.ActiveCfg = Debug|x64
-		{31AC5304-CC50-4B3C-9D0F-1675241B65C5}.Debug|x64.Build.0 = Debug|x64
-		{31AC5304-CC50-4B3C-9D0F-1675241B65C5}.Release|Any CPU.ActiveCfg = Release|x64
-		{31AC5304-CC50-4B3C-9D0F-1675241B65C5}.Release|Any CPU.Build.0 = Release|x64
-		{31AC5304-CC50-4B3C-9D0F-1675241B65C5}.Release|x64.ActiveCfg = Release|x64
-		{31AC5304-CC50-4B3C-9D0F-1675241B65C5}.Release|x64.Build.0 = Release|x64
+		{F88A3C7F-A3D4-4F80-896E-1959A6000A98}.Debug|Any CPU.ActiveCfg = Debug|x64
+		{F88A3C7F-A3D4-4F80-896E-1959A6000A98}.Debug|Any CPU.Build.0 = Debug|x64
+		{F88A3C7F-A3D4-4F80-896E-1959A6000A98}.Debug|x64.ActiveCfg = Debug|x64
+		{F88A3C7F-A3D4-4F80-896E-1959A6000A98}.Debug|x64.Build.0 = Debug|x64
+		{F88A3C7F-A3D4-4F80-896E-1959A6000A98}.Release|Any CPU.ActiveCfg = Release|x64
+		{F88A3C7F-A3D4-4F80-896E-1959A6000A98}.Release|Any CPU.Build.0 = Release|x64
+		{F88A3C7F-A3D4-4F80-896E-1959A6000A98}.Release|x64.ActiveCfg = Release|x64
+		{F88A3C7F-A3D4-4F80-896E-1959A6000A98}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

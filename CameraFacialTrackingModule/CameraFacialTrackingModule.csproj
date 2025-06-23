@@ -12,14 +12,13 @@
   <ItemGroup>
     <None Remove="Assets\alvr.png" />
   </ItemGroup>
-
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\cameraFacialTrackingModule.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </EmbeddedResource>
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\VRCFaceTracking\VRCFaceTracking.Core\VRCFaceTracking.Core.csproj" />
   </ItemGroup>
 
-  <ItemGroup>
-    <EmbeddedResource Include="Assets\alvr.png">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </EmbeddedResource>
-  </ItemGroup>
 </Project>
