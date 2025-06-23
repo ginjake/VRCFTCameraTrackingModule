@@ -44,6 +44,15 @@ namespace CameraFacialTrackingModule
             udp = new UdpClient(9011);
             ep = new IPEndPoint(IPAddress.Any, 0);
             udp.BeginReceive(OnUdp, null);
+
+            // Example of an embedded image stream being referenced as a stream
+            var stream = GetType().Assembly.GetManifestResourceStream("CameraFacialTrackingModule.Assets.cameraFacialTrackingModule.png");
+
+
+            // Setting the stream to be referenced by VRCFaceTracking.
+            ModuleInformation.StaticImages =
+                stream != null ? new List<Stream> { stream } : ModuleInformation.StaticImages;
+
             return (true, true);
         }
 

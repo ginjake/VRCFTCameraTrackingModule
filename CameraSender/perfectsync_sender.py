@@ -26,7 +26,27 @@ PARAMS = {
     "TongueUp": "/avatar/parameters/TongueUp",
     "TongueDown": "/avatar/parameters/TongueDown",
     "TongueRight": "/avatar/parameters/TongueRight",
-    "TongueLeft": "/avatar/parameters/TongueLeft"
+    "TongueLeft": "/avatar/parameters/TongueLeft",
+    # アイトラッキングパラメータ（パーフェクトシンク仕様）
+    "EyesX": "/avatar/parameters/EyesX",
+    "EyesY": "/avatar/parameters/EyesY",
+    "LeftEyeLid": "/avatar/parameters/LeftEyeLid",
+    "RightEyeLid": "/avatar/parameters/RightEyeLid",
+    "EyesWiden": "/avatar/parameters/EyesWiden",
+    "EyeSquintRight": "/avatar/parameters/EyeSquintRight",
+    "EyeSquintLeft": "/avatar/parameters/EyeSquintLeft",
+    "EyeWideLeft": "/avatar/parameters/EyeWideLeft",
+    "EyeWideRight": "/avatar/parameters/EyeWideRight",
+    # 眉毛パラメータ（パーフェクトシンク仕様）
+    "BrowInnerUpLeft": "/avatar/parameters/BrowInnerUpLeft",
+    "BrowInnerUpRight": "/avatar/parameters/BrowInnerUpRight",
+    "BrowLowererLeft": "/avatar/parameters/BrowLowererLeft",
+    "BrowLowererRight": "/avatar/parameters/BrowLowererRight",
+    "BrowOuterUpLeft": "/avatar/parameters/BrowOuterUpLeft",
+    "BrowOuterUpRight": "/avatar/parameters/BrowOuterUpRight",
+    # 鼻パラメータ
+    "NoseSneerLeft": "/avatar/parameters/NoseSneerLeft",
+    "NoseSneerRight": "/avatar/parameters/NoseSneerRight"
 }
 
 class FacialTracker:
@@ -80,9 +100,16 @@ class FacialTracker:
         self.face_scale_factor = 1.0  # 顔のサイズ補正
         self.mouth_aspect_ratio = 1.0  # 口の縦横比補正
         
+        # アイトラッキング設定
+        self.eye_tracking_enabled = False  # 初期状態ではオフ
+        
         # パラメータの基準値バッファ初期化
+        self.baseline = {}  # 基準値辞書を初期化
         for param in PARAMS.keys():
             self.baseline_buffer[param] = deque(maxlen=60)  # 2秒間のバッファ
+            # キャリブレーション用の基準値は空リストで初期化（顎の左右以外）
+            if param not in ['JawRight', 'JawLeft']:
+                self.baseline[param] = []  # キャリブレーション時にデータを収集するためのリスト
         
         # 口のランドマークインデックス（MediaPipeの468点ランドマーク）
         self.mouth_landmarks = {
@@ -117,24 +144,25 @@ class FacialTracker:
             
             # パラメータの基準値を収集
             for key, val in params.items():
-                if key not in self.baseline:
-                    self.baseline[key] = []
-                self.baseline[key].append(val)
+                if key in self.baseline:  # 初期化済みのパラメータのみ処理
+                    self.baseline[key].append(val)
             
             self.calibration_frames += 1
             return False
         else:
             # 平均値を基準として設定
             for key in self.baseline:
-                values = self.baseline[key]
-                # 外れ値を除去して平均を計算
-                sorted_values = sorted(values)
-                trim_count = len(sorted_values) // 10  # 上下10%をカット
-                if trim_count > 0:
-                    trimmed_values = sorted_values[trim_count:-trim_count]
-                else:
-                    trimmed_values = sorted_values
-                self.baseline[key] = np.mean(trimmed_values)
+                if isinstance(self.baseline[key], list) and len(self.baseline[key]) > 0:
+                    values = self.baseline[key]
+                    # 外れ値を除去して平均を計算
+                    sorted_values = sorted(values)
+                    trim_count = len(sorted_values) // 10  # 上下10%をカット
+                    if trim_count > 0:
+                        trimmed_values = sorted_values[trim_count:-trim_count]
+                    else:
+                        trimmed_values = sorted_values
+                    self.baseline[key] = np.mean(trimmed_values)
+                # リストでない場合（初期値0.0）はそのまま維持
             
             self.calibration_needed = False
             print(f"Calibration completed. Face scale: {self.face_scale_factor:.2f}, Mouth ratio: {self.mouth_aspect_ratio:.2f}")
@@ -159,11 +187,13 @@ class FacialTracker:
         movement_detected = False
         for key, val in params.items():
             if key in self.baseline and key not in ['JawRight', 'JawLeft']:
-                diff = abs(val - self.baseline[key])
-                if diff > 0.1:
-                    movement_detected = True
-                    self.last_movement_time = current_time
-                    break
+                # 基準値が数値の場合のみ比較（リストの場合はスキップ）
+                if isinstance(self.baseline[key], (int, float)):
+                    diff = abs(val - self.baseline[key])
+                    if diff > 0.1:
+                        movement_detected = True
+                        self.last_movement_time = current_time
+                        break
         
         # 2秒間動きがない場合、基準値を更新（顎以外）
         if not movement_detected and (current_time - self.last_movement_time) > 2.0:
@@ -173,7 +203,10 @@ class FacialTracker:
                     if len(self.baseline_buffer[key]) >= 20:
                         new_baseline = np.mean(list(self.baseline_buffer[key]))
                         # より積極的に更新（カメラ角度変化に対応）
-                        self.baseline[key] = self.baseline[key] * 0.9 + new_baseline * 0.1
+                        if key in self.baseline and isinstance(self.baseline[key], (int, float)):
+                            self.baseline[key] = self.baseline[key] * 0.9 + new_baseline * 0.1
+                        else:
+                            self.baseline[key] = new_baseline  # 初回は直接設定
                         self.baseline_buffer[key].clear()
 
     def calculate_face_orientation(self, landmarks, w, h):
@@ -217,12 +250,22 @@ class FacialTracker:
         return orientation
 
     def calculate_raw_params(self, landmarks, w, h):
-        """生の顔パラメータを計算"""
+        """生の顔パラメータを計算（距離正規化対応）"""
         def get_xy(idx):
             return landmarks[idx].x * w, landmarks[idx].y * h
         
         def get_xyz(idx):
             return landmarks[idx].x * w, landmarks[idx].y * h, landmarks[idx].z
+        
+        # 顔のスケール計算（距離正規化の基準）
+        left_cheek = landmarks[234]
+        right_cheek = landmarks[454]
+        face_width = abs(left_cheek.x - right_cheek.x) * w
+        face_height = abs(landmarks[10].y - landmarks[152].y) * h  # 額から顎
+        face_scale = (face_width + face_height) / 2  # 平均スケール
+        
+        # 正規化係数（基準顔サイズ200pxとして）
+        scale_factor = 200.0 / (face_scale + 1e-6)
         
         # 顔の向きを取得
         orientation = self.calculate_face_orientation(landmarks, w, h)
@@ -312,8 +355,8 @@ class FacialTracker:
         jaw_open_factor = precise_mouth_height / 10.0  # 10で割って0-1範囲に正規化
         
         # 舌の位置（口の開きを考慮）
-        # 口が開いているかチェック
-        mouth_is_open = jaw_open_factor > 0.1  # JawOpenが一定以上の時のみ舌を検出
+        # 口が開いているかチェック - より厳密に
+        mouth_is_open = jaw_open_factor > 0.05  # より低い閾値で舌検出を開始
         
         if mouth_is_open:
             # 舌関連のランドマーク
@@ -321,17 +364,18 @@ class FacialTracker:
             lower_lip_center = get_rotated(14)  # 下唇中央
             upper_lip_center = get_rotated(13)  # 上唇中央
             
-            # X軸（左右）の動き - より精密な計算
-            tongue_x_displacement = (tongue_tip[0] - mouth_center_x) / (mouth_width * 0.4 + 1e-6)
-            # より大きなデッドゾーンで安定化
-            if abs(tongue_x_displacement) < 0.1:
+            # X軸（左右）の動き - 距離正規化対応
+            tongue_x_displacement = (tongue_tip[0] - mouth_center_x) / (mouth_width + 1e-6)
+            # スケール正規化されたデッドゾーン
+            deadzone = 0.1 / scale_factor
+            if abs(tongue_x_displacement) < deadzone:
                 tongue_x_displacement = 0
             else:
                 # デッドゾーンを引いて感度調整
                 if tongue_x_displacement > 0:
-                    tongue_x_displacement = max(tongue_x_displacement - 0.1, 0) * 1.5
+                    tongue_x_displacement = max(tongue_x_displacement - deadzone, 0) * 1.5
                 else:
-                    tongue_x_displacement = min(tongue_x_displacement + 0.1, 0) * 1.5
+                    tongue_x_displacement = min(tongue_x_displacement + deadzone, 0) * 1.5
             
             # 舌の突出度 - より簡単な計算
             # 舌先が下唇より下にあるかどうかで判定
@@ -367,8 +411,8 @@ class FacialTracker:
             roll_correction = math.sin(orientation['roll']) * 0.2
             jaw_offset_from_center -= roll_correction
         
-        # 適応的なデッドゾーン（顔のサイズに比例）
-        adaptive_deadzone = 0.08 + (1.0 / max(self.face_scale_factor, 0.5)) * 0.02
+        # 適応的なデッドゾーン（距離正規化対応）
+        adaptive_deadzone = 0.08 * scale_factor
         
         # 変化量ベースの検出（前フレームとの差分も考慮）
         if not hasattr(self, 'prev_jaw_offset'):
@@ -393,9 +437,9 @@ class FacialTracker:
         # 顎の前後の動き
         jaw_forward_raw = landmarks[18].z * 30  # さらに穏やかに
         
-        # 顎の開き - より簡単な計算
-        jaw_open_normalized = precise_mouth_height / (mouth_width * 0.25 + 1e-6)
-        jaw_open_factor = max(jaw_open_normalized - 1.2, 0)  # 闾値を設定
+        # 顎の開き - 相対計算（距離無関係）
+        jaw_open_ratio = precise_mouth_height / (mouth_width + 1e-6)  # 口の縦横比
+        jaw_open_factor = max(jaw_open_ratio - 0.15, 0) * 5  # 基準比率から差分を取る
         
         # 頬の膨らみ（改善版）- より安定した検出
         left_corner_x, left_corner_y = get_rotated(61)
@@ -436,14 +480,204 @@ class FacialTracker:
             "MouthPucker": min(max(pucker_intensity, 0), 1),
             "CheekPuffRight": min(max(right_cheek_expansion * 3, 0), 1),  # 中立域考慮済み
             "CheekPuffLeft": min(max(left_cheek_expansion * 3, 0), 1),   # 中立域考慮済み
-            "TongueOut": min(max(tongue_protrusion_raw, 0), 1),
-            "TongueUp": min(max(tongue_up_raw, 0), 1),
-            "TongueDown": min(max(tongue_down_raw, 0), 1),
-            "TongueRight": min(max(tongue_x_displacement * 3, 0), 1),  # 両方向とも確実に動作
-            "TongueLeft": min(max(-tongue_x_displacement * 3, 0), 1)   # 両方向とも確実に動作
+            "TongueOut": min(max(tongue_protrusion_raw, 0), 1) if mouth_is_open else 0,
+            "TongueUp": min(max(tongue_up_raw, 0), 1) if mouth_is_open else 0,
+            "TongueDown": min(max(tongue_down_raw, 0), 1) if mouth_is_open else 0,
+            "TongueRight": min(max(tongue_x_displacement * 3, 0), 1) if mouth_is_open else 0,
+            "TongueLeft": min(max(-tongue_x_displacement * 3, 0), 1) if mouth_is_open else 0
+        }
+        
+        # スケール情報を保存（デバッグ用）
+        self.last_scale_info = {
+            'factor': scale_factor,
+            'scale': face_scale
         }
         
         return params
+
+    def calculate_nose_params(self, landmarks, w, h):
+        """鼻の動きを検出（距離に依存しない相対計算）"""
+        try:
+            # 鼻翼のランドマーク
+            left_nostril_wing = landmarks[219]    # 左鼻翼
+            right_nostril_wing = landmarks[439]   # 右鼻翼  
+            nose_center = landmarks[2]            # 鼻中央
+            
+            # 顔の基準サイズ（左右頬の距離）を使って正規化
+            left_cheek = landmarks[234]
+            right_cheek = landmarks[454]
+            face_width = abs(left_cheek.x - right_cheek.x)
+            
+            # 鼻翼の中心線からの相対距離（顔幅で正規化）
+            left_nostril_ratio = abs(left_nostril_wing.x - nose_center.x) / (face_width + 1e-6)
+            right_nostril_ratio = abs(right_nostril_wing.x - nose_center.x) / (face_width + 1e-6)
+            
+            # 基準比率を設定（初回のみ）
+            if not hasattr(self, 'base_nostril_ratio'):
+                self.base_nostril_ratio = {
+                    'left': left_nostril_ratio,
+                    'right': right_nostril_ratio
+                }
+            
+            # 比率の変化を計算（距離に依存しない）
+            left_ratio_change = left_nostril_ratio - self.base_nostril_ratio['left']
+            right_ratio_change = right_nostril_ratio - self.base_nostril_ratio['right']
+            
+            # 正規化と感度調整（相対値なので距離無関係）
+            left_nose_sneer = max(0, left_ratio_change / 0.02)  # 2%の変化で1.0
+            right_nose_sneer = max(0, right_ratio_change / 0.02)
+            
+            # 感度調整
+            left_nose_sneer = min(1, left_nose_sneer * 3)
+            right_nose_sneer = min(1, right_nose_sneer * 3)
+            
+            nose_params = {
+                "NoseSneerLeft": max(0, min(1, left_nose_sneer)),
+                "NoseSneerRight": max(0, min(1, right_nose_sneer))
+            }
+            
+            # デバッグ情報を保存（描画用）
+            self.nose_debug_info = {
+                'left_ratio': left_nostril_ratio,
+                'right_ratio': right_nostril_ratio,
+                'left_base': self.base_nostril_ratio['left'],
+                'right_base': self.base_nostril_ratio['right'],
+                'left_change': left_ratio_change,
+                'right_change': right_ratio_change,
+                'face_width': face_width
+            }
+            
+            return nose_params
+            
+        except (IndexError, AttributeError):
+            return {"NoseSneerLeft": 0, "NoseSneerRight": 0}
+
+    def calculate_eye_params(self, landmarks, w, h, face_scale):
+        """パーフェクトシンク仕様のアイトラッキング・眉毛パラメータを計算"""
+        if not self.eye_tracking_enabled:
+            return {}
+        
+        # スケール係数を計算
+        scale_factor = 200.0 / (face_scale + 1e-6)
+        
+        # 目のランドマーク（MediaPipe 468点）
+        # 左目: 33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246
+        # 右目: 362, 398, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382
+        # 眉毛: 70, 63, 105, 66, 107, 55, 65, 52, 53, 46, 285, 295, 296, 334, 293, 300, 276, 283, 282, 295
+        
+        # 左目の詳細な測定点
+        left_eye_inner = landmarks[133]  # 左目内角
+        left_eye_outer = landmarks[33]   # 左目外角
+        left_eye_top = landmarks[159]    # 左目上端
+        left_eye_bottom = landmarks[145] # 左目下端
+        left_eye_center_x = (left_eye_inner.x + left_eye_outer.x) * w / 2
+        left_eye_center_y = (left_eye_top.y + left_eye_bottom.y) * h / 2
+        left_eye_height = abs(left_eye_top.y - left_eye_bottom.y) * h
+        left_eye_width = abs(left_eye_outer.x - left_eye_inner.x) * w
+        
+        # 右目の詳細な測定点
+        right_eye_inner = landmarks[362]  # 右目内角
+        right_eye_outer = landmarks[263]  # 右目外角
+        right_eye_top = landmarks[386]    # 右目上端
+        right_eye_bottom = landmarks[374] # 右目下端
+        right_eye_center_x = (right_eye_inner.x + right_eye_outer.x) * w / 2
+        right_eye_center_y = (right_eye_top.y + right_eye_bottom.y) * h / 2
+        right_eye_height = abs(right_eye_top.y - right_eye_bottom.y) * h
+        right_eye_width = abs(right_eye_outer.x - right_eye_inner.x) * w
+        
+        # 顔の基準点
+        face_center_x = landmarks[1].x * w
+        face_center_y = landmarks[1].y * h
+        
+        # 目の視線計算（パーフェクトシンク仕様に近い）
+        # 瞳孔位置の推定（アイリス追跡の代替として目の中心位置を使用）
+        left_gaze_x = (left_eye_center_x - face_center_x) / (left_eye_width * 2)
+        left_gaze_y = -(left_eye_center_y - face_center_y) / (left_eye_height * 2)
+        right_gaze_x = (right_eye_center_x - face_center_x) / (right_eye_width * 2)
+        right_gaze_y = -(right_eye_center_y - face_center_y) / (right_eye_height * 2)
+        
+        # 平均視線（EyesX, EyesY）
+        eyes_x = (left_gaze_x + right_gaze_x) / 2
+        eyes_y = (left_gaze_y + right_gaze_y) / 2
+        
+        # 基準目の高さを設定（キャリブレーション）
+        if not hasattr(self, 'base_eye_height'):
+            self.base_eye_height = max(left_eye_height, right_eye_height, 1)
+        
+        # まばたき検出
+        left_openness = left_eye_height / self.base_eye_height
+        right_openness = right_eye_height / self.base_eye_height
+        left_eyelid = max(0, 1.0 - left_openness)
+        right_eyelid = max(0, 1.0 - right_openness)
+        
+        # 目を細める検出（より精密）
+        left_squint = max(0, min(1, (0.4 - left_openness) * 2.5))
+        right_squint = max(0, min(1, (0.4 - right_openness) * 2.5))
+        
+        # 目を見開く検出（左右別々）
+        left_wide = max(0, min(1, (left_openness - 1.0) * 2))
+        right_wide = max(0, min(1, (right_openness - 1.0) * 2))
+        
+        # 全体の目を見開く
+        eyes_widen = (left_wide + right_wide) / 2
+        
+        # 眉毛のランドマーク
+        # 左眉毛: 70(外), 107(中), 55(内)
+        # 右眉毛: 285(外), 296(中), 334(内)
+        left_brow_inner = landmarks[55]   # 左眉内側
+        left_brow_middle = landmarks[107] # 左眉中央
+        left_brow_outer = landmarks[70]   # 左眉外側
+        right_brow_inner = landmarks[285] # 右眉内側
+        right_brow_middle = landmarks[296]# 右眉中央
+        right_brow_outer = landmarks[334] # 右眉外側
+        
+        # 眉毛の基準位置（目との相対位置）
+        left_brow_inner_height = (left_eye_top.y - left_brow_inner.y) * h
+        left_brow_outer_height = (left_eye_top.y - left_brow_outer.y) * h
+        right_brow_inner_height = (right_eye_top.y - right_brow_inner.y) * h
+        right_brow_outer_height = (right_eye_top.y - right_brow_outer.y) * h
+        
+        # 基準眉毛高さを設定
+        if not hasattr(self, 'base_brow_height'):
+            self.base_brow_height = {
+                'left_inner': left_brow_inner_height,
+                'left_outer': left_brow_outer_height,
+                'right_inner': right_brow_inner_height,
+                'right_outer': right_brow_outer_height
+            }
+        
+        # 眉毛の動きを計算（距離正規化対応）
+        brow_scale = 10 * scale_factor  # スケール調整された除数
+        brow_inner_up_left = max(0, (left_brow_inner_height - self.base_brow_height['left_inner']) / brow_scale)
+        brow_inner_up_right = max(0, (right_brow_inner_height - self.base_brow_height['right_inner']) / brow_scale)
+        brow_outer_up_left = max(0, (left_brow_outer_height - self.base_brow_height['left_outer']) / brow_scale)
+        brow_outer_up_right = max(0, (right_brow_outer_height - self.base_brow_height['right_outer']) / brow_scale)
+        
+        # 眉をひそめる（眉毛が下がる）- 距離正規化対応
+        brow_down_scale = 8 * scale_factor  # スケール調整された除数
+        brow_lowerer_left = max(0, (self.base_brow_height['left_inner'] - left_brow_inner_height) / brow_down_scale)
+        brow_lowerer_right = max(0, (self.base_brow_height['right_inner'] - right_brow_inner_height) / brow_down_scale)
+        
+        eye_params = {
+            "EyesX": max(-1, min(1, eyes_x)),
+            "EyesY": max(-1, min(1, eyes_y)),
+            "LeftEyeLid": max(0, min(1, left_eyelid)),
+            "RightEyeLid": max(0, min(1, right_eyelid)),
+            "EyesWiden": max(0, min(1, eyes_widen)),
+            "EyeSquintLeft": max(0, min(1, left_squint)),
+            "EyeSquintRight": max(0, min(1, right_squint)),
+            "EyeWideLeft": max(0, min(1, left_wide)),
+            "EyeWideRight": max(0, min(1, right_wide)),
+            # 眉毛パラメータ
+            "BrowInnerUpLeft": max(0, min(1, brow_inner_up_left)),
+            "BrowInnerUpRight": max(0, min(1, brow_inner_up_right)),
+            "BrowLowererLeft": max(0, min(1, brow_lowerer_left)),
+            "BrowLowererRight": max(0, min(1, brow_lowerer_right)),
+            "BrowOuterUpLeft": max(0, min(1, brow_outer_up_left)),
+            "BrowOuterUpRight": max(0, min(1, brow_outer_up_right))
+        }
+        
+        return eye_params
 
     def smooth_params(self, params):
         """パラメータのスムージング"""
@@ -476,8 +710,23 @@ class FacialTracker:
                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
                 return frame
             
+            # 顔スケール計算（全体で共有）
+            left_cheek = landmarks[234]
+            right_cheek = landmarks[454]
+            face_width = abs(left_cheek.x - right_cheek.x) * w
+            face_height = abs(landmarks[10].y - landmarks[152].y) * h
+            face_scale = (face_width + face_height) / 2
+            
             # パラメータ計算
             raw_params = self.calculate_raw_params(landmarks, w, h)
+            
+            # 鼻パラメータを追加
+            nose_params = self.calculate_nose_params(landmarks, w, h)
+            raw_params.update(nose_params)
+            
+            # アイトラッキングパラメータを追加（スケール情報を渡す）
+            eye_params = self.calculate_eye_params(landmarks, w, h, face_scale)
+            raw_params.update(eye_params)
             
             # 適応的基準値更新
             self.update_baseline_adaptively(raw_params)
@@ -485,8 +734,8 @@ class FacialTracker:
             # キャリブレーション基準値から差分を計算
             calibrated_params = {}
             for key, val in raw_params.items():
-                if key in self.baseline:
-                    # 基準値からの変化を計算
+                if key in self.baseline and isinstance(self.baseline[key], (int, float)):
+                    # 基準値からの変化を計算（数値の基準値がある場合のみ）
                     if key in ["JawOpen", "TongueOut", "TongueUp", "TongueDown", "CheekPuffRight", "CheekPuffLeft"]:
                         # 基準値からの差分で計算し、マイナス値を防ぐ
                         diff = val - self.baseline[key]
@@ -500,19 +749,42 @@ class FacialTracker:
                     else:
                         calibrated_params[key] = val
                 else:
+                    # 基準値がない場合や顎の左右は生の値をそのまま使用
                     calibrated_params[key] = val
             
             # スムージング適用
             smoothed_params = self.smooth_params(calibrated_params)
             
-            # OSC送信とUI表示
-            y = 60
+            # OSC送信とUI表示 - 2列に分けて表示
+            h, w, _ = frame.shape
+            left_col_x = 10
+            right_col_x = w // 2 + 10
+            left_y = 60
+            right_y = 60
+            
+            # パラメータを2列に分けて表示
+            param_count = 0
             for key, val in smoothed_params.items():
-                self.osc_client.send_message(PARAMS[key], float(val))
-                color = (0, 255, 0) if val > 0.1 else (100, 100, 100)
-                cv2.putText(frame, f"{key}: {val:.3f}", (10, y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                y += 20
+                if key in PARAMS:  # パラメータが定義されている場合のみ送信
+                    self.osc_client.send_message(PARAMS[key], float(val))
+                    color = (0, 255, 0) if abs(val) > 0.1 else (100, 100, 100)
+                    
+                    # 左列と右列に交互に表示（文字サイズ拡大）
+                    if param_count % 2 == 0:
+                        cv2.putText(frame, f"{key}: {val:.3f}", (left_col_x, left_y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        left_y += 25
+                    else:
+                        cv2.putText(frame, f"{key}: {val:.3f}", (right_col_x, right_y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        right_y += 25
+                    param_count += 1
+            
+            # アイトラッキング状態表示（上部中央）
+            eye_status = "ON" if self.eye_tracking_enabled else "OFF"
+            eye_color = (0, 255, 0) if self.eye_tracking_enabled else (0, 0, 255)
+            cv2.putText(frame, f"Eye Tracking: {eye_status}", (w//2 - 120, 35),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, eye_color, 2)
             
             # 口のランドマークを描画（デバッグ用）
             mouth_points = []
@@ -521,6 +793,35 @@ class FacialTracker:
                 y = int(landmarks[idx].y * h)
                 cv2.circle(frame, (x, y), 2, (0, 255, 255), -1)
                 mouth_points.append((x, y))
+            
+            # 鼻のランドマークを描画（デバッグ用）
+            nose_points = [219, 439, 2]  # 左鼻翼、右鼻翼、鼻中央
+            for idx in nose_points:
+                x = int(landmarks[idx].x * w)
+                y = int(landmarks[idx].y * h)
+                color = (255, 0, 255) if idx == 2 else (0, 255, 0)  # 中央は紫、翼は緑
+                cv2.circle(frame, (x, y), 3, color, -1)
+            
+            # 鼻のデバッグ情報を表示
+            if hasattr(self, 'nose_debug_info'):
+                debug_info = self.nose_debug_info
+                debug_y = h - 150
+                cv2.putText(frame, f"Nose Debug:", (10, debug_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, f"L: {debug_info['left_change']:.3f} ({debug_info['left_ratio']:.3f})", (10, debug_y + 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                cv2.putText(frame, f"R: {debug_info['right_change']:.3f} ({debug_info['right_ratio']:.3f})", (10, debug_y + 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                cv2.putText(frame, f"Face W: {debug_info['face_width']:.3f}", (10, debug_y + 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            
+            # 全体的なスケール情報を表示
+            if hasattr(self, 'last_scale_info'):
+                scale_info = self.last_scale_info
+                cv2.putText(frame, f"Scale Factor: {scale_info['factor']:.2f}", (w - 200, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, f"Face Scale: {scale_info['scale']:.1f}px", (w - 200, 50),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             # 口の輪郭線を描画
             if len(mouth_points) >= 4:
@@ -544,13 +845,13 @@ def main():
         print("Error: Cannot open camera")
         return
     
-    # カメラ設定
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # カメラ設定 - より大きなプレビュー
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
     
     print("Camera opened successfully!")
-    print("Press 'r' to recalibrate, 'c' to calibrate, 'q' to quit")
+    print("Press 'r' to recalibrate, 'c' to calibrate, 'a' to toggle eye tracking, 'q' to quit")
     
     while True:
         ret, frame = cap.read()
@@ -564,11 +865,13 @@ def main():
         # トラッキング処理
         frame = tracker.process_frame(frame)
         
-        # キャリブレーションボタン用のテキストを追加
-        cv2.putText(frame, "Press 'c' to calibrate (face neutral position)", (10, frame.shape[0] - 30),
+        # コントロール用のテキストを追加（右下に配置して重複回避）
+        h, w, _ = frame.shape
+        help_x = w - 400
+        cv2.putText(frame, "Controls:", (help_x, h - 70),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "Press 'r' to reset calibration", (10, frame.shape[0] - 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "'c': Calibrate | 'r': Reset | 'a': Eye tracking | 'q': Quit", (help_x, h - 50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
         cv2.imshow('VRChat Facial OSC Tracking - Fixed', frame)
         
@@ -587,6 +890,11 @@ def main():
             tracker.calibration_frames = 0
             tracker.baseline = {}
             print("Starting calibration... Keep face in neutral position for 2 seconds")
+        elif key == ord('a'):
+            # アイトラッキング切り替え
+            tracker.eye_tracking_enabled = not tracker.eye_tracking_enabled
+            status = "enabled" if tracker.eye_tracking_enabled else "disabled"
+            print(f"Eye tracking {status}")
     
     cap.release()
     cv2.destroyAllWindows()
