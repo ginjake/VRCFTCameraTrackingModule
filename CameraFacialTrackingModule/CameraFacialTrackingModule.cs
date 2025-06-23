@@ -11,13 +11,13 @@ namespace CameraFacialTrackingModule
 {
     public class CameraFacialTrackingModule : ExtTrackingModule
     {
-        // パラメータ受信用
-        private readonly float[] values = new float[14];
+        // パラメータ受信用（アイトラッキング・眉毛・鼻パラメータを追加）
+        private readonly float[] values = new float[32];
 
         private UdpClient udp;
         private IPEndPoint ep;
 
-        // 対応表情の順番を定義
+        // 対応表情の順番を定義（perfectsync_sender.pyと同じ順序）
         private static readonly string[] ParamKeys = new[]
         {
             "JawOpen",
@@ -33,10 +33,30 @@ namespace CameraFacialTrackingModule
             "TongueUp",
             "TongueDown",
             "TongueRight",
-            "TongueLeft"
+            "TongueLeft",
+            // アイトラッキングパラメータ
+            "EyesX",
+            "EyesY",
+            "LeftEyeLid",
+            "RightEyeLid",
+            "EyesWiden",
+            "EyeSquintRight",
+            "EyeSquintLeft",
+            "EyeWideLeft",
+            "EyeWideRight",
+            // 眉毛パラメータ
+            "BrowInnerUpLeft",
+            "BrowInnerUpRight",
+            "BrowLowererLeft",
+            "BrowLowererRight",
+            "BrowOuterUpLeft",
+            "BrowOuterUpRight",
+            // 鼻パラメータ
+            "NoseSneerLeft",
+            "NoseSneerRight"
         };
 
-        public override (bool SupportsEye, bool SupportsExpression) Supported => (false, true);
+        public override (bool SupportsEye, bool SupportsExpression) Supported => (true, true);
 
         public override (bool eyeSuccess, bool expressionSuccess) Initialize(bool eyeAvailable, bool expressionAvailable)
         {
@@ -58,13 +78,14 @@ namespace CameraFacialTrackingModule
 
         public override void Update()
         {
+            // 口・顔の表情パラメータ
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawOpen].Weight = values[0];
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawRight].Weight = values[1];
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawLeft].Weight = values[2];
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.JawForward].Weight = values[3];
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.MouthCornerPullRight].Weight = values[4];
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.MouthCornerPullLeft].Weight = values[5];
-//            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.MouthPucker].Weight = values[6];
+            // UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.MouthPucker].Weight = values[6]; // MouthPuckerは未定義のためコメントアウト
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.CheekPuffRight].Weight = values[7];
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.CheekPuffLeft].Weight = values[8];
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.TongueOut].Weight = values[9];
@@ -72,6 +93,31 @@ namespace CameraFacialTrackingModule
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.TongueDown].Weight = values[11];
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.TongueRight].Weight = values[12];
             UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.TongueLeft].Weight = values[13];
+            
+            // アイトラッキングパラメータ
+            UnifiedTracking.Data.Eye.Left.Gaze.x = values[14]; // EyesX
+            UnifiedTracking.Data.Eye.Left.Gaze.y = values[15]; // EyesY
+            UnifiedTracking.Data.Eye.Right.Gaze.x = values[14]; // EyesX
+            UnifiedTracking.Data.Eye.Right.Gaze.y = values[15]; // EyesY
+            // LeftEyeLidとRightEyeLidは既に0-1で閉じた度合いなので、Opennessには1から引く
+            UnifiedTracking.Data.Eye.Left.Openness = 1.0f - values[16]; // LeftEyeLid (0=開, 1=閉)
+            UnifiedTracking.Data.Eye.Right.Openness = 1.0f - values[17]; // RightEyeLid (0=開, 1=閉)
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.EyeWideLeft].Weight = values[21];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.EyeWideRight].Weight = values[22];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.EyeSquintLeft].Weight = values[20];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.EyeSquintRight].Weight = values[19];
+            
+            // 眉毛パラメータ
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.BrowInnerUpLeft].Weight = values[23];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.BrowInnerUpRight].Weight = values[24];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.BrowLowererLeft].Weight = values[25];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.BrowLowererRight].Weight = values[26];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.BrowOuterUpLeft].Weight = values[27];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.BrowOuterUpRight].Weight = values[28];
+            
+            // 鼻パラメータ
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.NoseSneerLeft].Weight = values[29];
+            UnifiedTracking.Data.Shapes[(int)UnifiedExpressions.NoseSneerRight].Weight = values[30];
 
             Thread.Sleep(4);
         }
