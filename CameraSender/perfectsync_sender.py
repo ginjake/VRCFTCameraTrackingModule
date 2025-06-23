@@ -57,28 +57,28 @@ class FacialTracker:
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_detection_confidence=0.01,  # 最低限界まで下げて超至近距離検出
+            min_tracking_confidence=0.01,   # 最小限で部分的顔も追跡
             static_image_mode=False
         )
         
         # スムージング用のバッファ（適応的サイズ）
         self.smoothing_buffer = {}
         self.buffer_sizes = {
-            'JawOpen': 3,  # 口の開閉は反応速度重視
-            'TongueOut': 3,  # 舌も反応速度重視
-            'TongueUp': 3,
-            'TongueDown': 3,
-            'TongueRight': 3,
-            'TongueLeft': 3,
-            'MouthCornerPullRight': 4,  # 口角は中程度のスムージング
-            'MouthCornerPullLeft': 4,
-            'MouthPucker': 5,  # 口すぼめは安定性重視
-            'CheekPuffRight': 6,  # 頬膨らみは最も安定性重視
-            'CheekPuffLeft': 6,
-            'JawRight': 4,
-            'JawLeft': 4,
-            'JawForward': 4
+            'JawOpen': 1,  # 超至近距離用に瞬時反応
+            'TongueOut': 1,  # 舌も瞬時反応
+            'TongueUp': 1,
+            'TongueDown': 1,
+            'TongueRight': 1,
+            'TongueLeft': 1,
+            'MouthCornerPullRight': 1,  # 口角も瞬時反応
+            'MouthCornerPullLeft': 1,
+            'MouthPucker': 1,  # 口すぼめも瞬時反応
+            'CheekPuffRight': 2,  # 頬膨らみも最小限に
+            'CheekPuffLeft': 2,
+            'JawRight': 1,
+            'JawLeft': 1,
+            'JawForward': 1
         }
         for param in PARAMS.keys():
             buffer_size = self.buffer_sizes.get(param, 5)
@@ -264,8 +264,8 @@ class FacialTracker:
         face_height = abs(landmarks[10].y - landmarks[152].y) * h  # 額から顎
         face_scale = (face_width + face_height) / 2  # 平均スケール
         
-        # 正規化係数（基準顔サイズ200pxとして）
-        scale_factor = 200.0 / (face_scale + 1e-6)
+        # 正規化係数（超至近距離10cm用に基準顔サイズを1000pxに極限拡大）
+        scale_factor = 1000.0 / (face_scale + 1e-6)
         
         # 顔の向きを取得
         orientation = self.calculate_face_orientation(landmarks, w, h)
@@ -845,10 +845,14 @@ def main():
         print("Error: Cannot open camera")
         return
     
-    # カメラ設定 - より大きなプレビュー
+    # カメラ設定 - より大きなプレビュー + VR近距離用オートフォーカス
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
+    
+    # VR近距離撮影用のフォーカス設定
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # オートフォーカス有効
+    cap.set(cv2.CAP_PROP_FOCUS, 0)      # 最小フォーカス距離に設定
     
     print("Camera opened successfully!")
     print("Press 'r' to recalibrate, 'c' to calibrate, 'a' to toggle eye tracking, 'q' to quit")
