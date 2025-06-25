@@ -21,7 +21,8 @@ CameraSender内の `perfectsync_sender.py` のIPとポートをいい感じに�
 PowerShellなどで以下のコマンドを実行。
 
 ```powershell
-pip install opencv-python mediapipe python-osc
+cd CameraSender  
+pip install -r requirements.txt
 ```
 
 次に、cameraSender ディレクトリ内で以下を実行。

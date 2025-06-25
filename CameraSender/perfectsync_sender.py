@@ -540,7 +540,7 @@ class FacialTracker:
         pose_3d = self.get_3d_pose(landmarks, w, h)
         
         if pose_3d['success']:
-            # 単純化：顎の中心からの横方向偏移を直接計算
+            # === 顎の左右動作の改善（感度差解消） ===
             chin_point = landmarks[18]
             face_center_x = (landmarks[234].x + landmarks[454].x) * w / 2
             face_width = abs(landmarks[234].x - landmarks[454].x) * w
@@ -548,24 +548,65 @@ class FacialTracker:
             # 顎の横方向偏移（正面時は0になるように）
             jaw_offset = (chin_point.x * w - face_center_x) / (face_width + 1e-6)
             
-            # より大きなデッドゾーンで正面時の振動を防ぐ
-            jaw_deadzone = 0.03  # 3%のデッドゾーン
+            # さらに小さなデッドゾーンで感度向上
+            jaw_deadzone = 0.015  # 1.5%のデッドゾーン（さらに削減）
             
             if abs(jaw_offset) > jaw_deadzone:
-                jaw_displacement_x_raw = (jaw_offset - math.copysign(jaw_deadzone, jaw_offset)) * 5.0
+                # 左右の感度をさらに強化（特に右側）
+                if jaw_offset > 0:  # 右方向
+                    jaw_displacement_x_raw = (jaw_offset - jaw_deadzone) * 8.0  # 右側感度大幅アップ
+                else:  # 左方向
+                    jaw_displacement_x_raw = (jaw_offset + jaw_deadzone) * 7.0  # 左側も感度アップ
             else:
                 jaw_displacement_x_raw = 0
             
-            # 顎の前後の動き
-            jaw_forward_raw = max(0, landmarks[18].z * 10)
+            # === 顎の前後動作の改善（距離依存解消） ===
+            chin_point = landmarks[18]
+            upper_lip_center = landmarks[13]
+            
+            # 顎から上唇への距離を顔幅で正規化（距離依存解消）
+            chin_to_lip_distance_raw = abs(chin_point.y - upper_lip_center.y) * h
+            chin_to_lip_distance_normalized = chin_to_lip_distance_raw / (face_width + 1e-6)
+            
+            # 正規化された基準距離を設定
+            if not hasattr(self, 'base_chin_lip_ratio'):
+                self.base_chin_lip_ratio = chin_to_lip_distance_normalized
+            
+            # 正規化された距離の変化率で前後動作を検出
+            ratio_change = (chin_to_lip_distance_normalized - self.base_chin_lip_ratio) / (self.base_chin_lip_ratio + 1e-6)
+            
+            # 顎が前に出ると比率が小さくなるので、マイナス値を前進として扱う
+            jaw_forward_raw = max(0, -ratio_change * 10.0)  # 感度調整
             
         else:
             # 3D姿勢推定が失敗した場合のフォールバック
             chin_point = get_rotated(18)
             face_center_x = (landmarks[234].x + landmarks[454].x) * w / 2
-            jaw_offset_from_center = (chin_point[0] - face_center_x) / (mouth_width + 1e-6)
-            jaw_displacement_x_raw = jaw_offset_from_center * 3.0  # 低い感度
-            jaw_forward_raw = landmarks[18].z * 15
+            face_width = abs(landmarks[234].x - landmarks[454].x) * w
+            
+            # フォールバック時も同じ感度調整を適用
+            jaw_offset_from_center = (chin_point[0] - face_center_x) / (face_width + 1e-6)
+            jaw_deadzone = 0.015
+            
+            if abs(jaw_offset_from_center) > jaw_deadzone:
+                if jaw_offset_from_center > 0:  # 右方向
+                    jaw_displacement_x_raw = (jaw_offset_from_center - jaw_deadzone) * 8.0
+                else:  # 左方向
+                    jaw_displacement_x_raw = (jaw_offset_from_center + jaw_deadzone) * 7.0
+            else:
+                jaw_displacement_x_raw = 0
+            
+            # フォールバック時も正規化された距離検出
+            chin_point_landmark = landmarks[18]
+            upper_lip_center = landmarks[13]
+            chin_to_lip_distance_raw = abs(chin_point_landmark.y - upper_lip_center.y) * h
+            chin_to_lip_distance_normalized = chin_to_lip_distance_raw / (face_width + 1e-6)
+            
+            if not hasattr(self, 'base_chin_lip_ratio'):
+                self.base_chin_lip_ratio = chin_to_lip_distance_normalized
+            
+            ratio_change = (chin_to_lip_distance_normalized - self.base_chin_lip_ratio) / (self.base_chin_lip_ratio + 1e-6)
+            jaw_forward_raw = max(0, -ratio_change * 10.0)
         
         # （jaw_open_factorは上で既に計算済み）
         
@@ -594,22 +635,23 @@ class FacialTracker:
             left_cheek_expansion = max(0, (left_cheek_protrusion - 0.9) * 8.0)
             right_cheek_expansion = max(0, (right_cheek_protrusion - 0.9) * 8.0)
         
-        # パラメータの計算と正規化（最終版）
+        # パラメータの計算と正規化（確実に動作する部分のみ）
         params = {
-            "JawOpen": min(max(jaw_open_factor, 0), 1),  # キャリブレーションで基準値調整
-            "JawRight": min(max(jaw_displacement_x_raw, 0), 1),  # 復活
-            "JawLeft": min(max(-jaw_displacement_x_raw, 0), 1),  # 復活
-            "JawForward": min(max(jaw_forward_raw, 0), 1),
-            "MouthCornerPullRight": min(max(right_corner_pull * 3, 0), 1),
-            "MouthCornerPullLeft": min(max(left_corner_pull * 3, 0), 1),
-            "MouthPucker": min(max(pucker_intensity, 0), 1),
-            "CheekPuffRight": min(max(right_cheek_expansion, 0), 1),  # 復活（倍率削除）
-            "CheekPuffLeft": min(max(left_cheek_expansion, 0), 1),   # 復活（倍率削除）
-            "TongueOut": min(max(tongue_protrusion_raw, 0), 1) if mouth_very_open else 0,  # 改良
-            "TongueUp": min(max(tongue_up_raw, 0), 1) if mouth_very_open else 0,           # 改良
-            "TongueDown": min(max(tongue_down_raw, 0), 1) if mouth_very_open else 0,       # 改良
-            "TongueRight": min(max(tongue_x_displacement, 0), 1) if mouth_very_open else 0,  # 改良（倍率削除）
-            "TongueLeft": min(max(-tongue_x_displacement, 0), 1) if mouth_very_open else 0   # 改良（倍率削除）
+            "JawOpen": min(max(jaw_open_factor, 0), 1),  # 口の開閉 - 動作確認済み
+            "JawRight": min(max(jaw_displacement_x_raw, 0), 1),  # 顎右 - 動作確認済み
+            "JawLeft": min(max(-jaw_displacement_x_raw, 0), 1),  # 顎左 - 動作確認済み
+            "JawForward": 0,  # 無効化（動作しないため削除）
+            "MouthCornerPullRight": min(max(right_corner_pull * 3, 0), 1),  # 右口角 - 動作確認済み
+            "MouthCornerPullLeft": min(max(left_corner_pull * 3, 0), 1),  # 左口角 - 動作確認済み
+            "MouthPucker": min(max(pucker_intensity, 0), 1),  # 口すぼめ - 動作確認済み
+            # 以下は動作しないため無効化
+            "CheekPuffRight": 0,  # 無効化
+            "CheekPuffLeft": 0,   # 無効化
+            "TongueOut": 0,       # 無効化
+            "TongueUp": 0,        # 無効化
+            "TongueDown": 0,      # 無効化
+            "TongueRight": 0,     # 無効化
+            "TongueLeft": 0       # 無効化
         }
         
         # スケール情報を保存（デバッグ用）
@@ -621,6 +663,11 @@ class FacialTracker:
         # デバッグ用の口と頬のパラメータを保存
         self.last_mouth_params = {
             'jaw_open': params.get('JawOpen', 0),
+            'jaw_forward': params.get('JawForward', 0),
+            'jaw_forward_raw': jaw_forward_raw,
+            'chin_lip_ratio': chin_to_lip_distance_normalized if 'chin_to_lip_distance_normalized' in locals() else 0,
+            'chin_lip_base_ratio': getattr(self, 'base_chin_lip_ratio', 0),
+            'jaw_offset': jaw_offset if 'jaw_offset' in locals() else 0,
             'mouth_stretch': mouth_stretch if 'mouth_stretch' in locals() else 0,
             'cheek_left': params.get('CheekPuffLeft', 0),
             'cheek_right': params.get('CheekPuffRight', 0),
@@ -694,184 +741,25 @@ class FacialTracker:
             return {"NoseSneerLeft": 0, "NoseSneerRight": 0}
 
     def calculate_eye_params(self, landmarks, w, h, face_scale):
-        """パーフェクトシンク仕様のアイトラッキング・眉毛パラメータを計算"""
-        if not self.eye_tracking_enabled:
-            return {}
-        
-        # スケール係数を計算
-        scale_factor = 200.0 / (face_scale + 1e-6)
-        
-        # 目のランドマーク（MediaPipe 468点）
-        # 左目: 33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246
-        # 右目: 362, 398, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382
-        # 眉毛: 70, 63, 105, 66, 107, 55, 65, 52, 53, 46, 285, 295, 296, 334, 293, 300, 276, 283, 282, 295
-        
-        # 左目の詳細な測定点（より正確なランドマーク使用）
-        left_eye_inner = landmarks[133]  # 左目内角
-        left_eye_outer = landmarks[33]   # 左目外角
-        left_eye_top = landmarks[159]    # 左目上端
-        left_eye_bottom = landmarks[145] # 左目下端
-        # 追加：より正確な上下端点
-        left_eye_top_center = landmarks[158]    # 左目上端中央
-        left_eye_bottom_center = landmarks[153] # 左目下端中央
-        
-        left_eye_center_x = (left_eye_inner.x + left_eye_outer.x) * w / 2
-        left_eye_center_y = (left_eye_top.y + left_eye_bottom.y) * h / 2
-        # より正確な高さ測定（中央部分を使用）
-        left_eye_height = abs(left_eye_top_center.y - left_eye_bottom_center.y) * h
-        left_eye_width = abs(left_eye_outer.x - left_eye_inner.x) * w
-        
-        # 右目の詳細な測定点（より正確なランドマーク使用）
-        right_eye_inner = landmarks[362]  # 右目内角
-        right_eye_outer = landmarks[263]  # 右目外角
-        right_eye_top = landmarks[386]    # 右目上端
-        right_eye_bottom = landmarks[374] # 右目下端
-        # 追加：より正確な上下端点
-        right_eye_top_center = landmarks[385]   # 右目上端中央
-        right_eye_bottom_center = landmarks[380] # 右目下端中央
-        
-        right_eye_center_x = (right_eye_inner.x + right_eye_outer.x) * w / 2
-        right_eye_center_y = (right_eye_top.y + right_eye_bottom.y) * h / 2
-        # より正確な高さ測定（中央部分を使用）
-        right_eye_height = abs(right_eye_top_center.y - right_eye_bottom_center.y) * h
-        right_eye_width = abs(right_eye_outer.x - right_eye_inner.x) * w
-        
-        # 顔の基準点
-        face_center_x = landmarks[1].x * w
-        face_center_y = landmarks[1].y * h
-        
-        # 目の視線計算（パーフェクトシンク仕様に近い）
-        # 瞳孔位置の推定（アイリス追跡の代替として目の中心位置を使用）
-        left_gaze_x = (left_eye_center_x - face_center_x) / (left_eye_width * 2)
-        left_gaze_y = -(left_eye_center_y - face_center_y) / (left_eye_height * 2)
-        right_gaze_x = (right_eye_center_x - face_center_x) / (right_eye_width * 2)
-        right_gaze_y = -(right_eye_center_y - face_center_y) / (right_eye_height * 2)
-        
-        # 平均視線（EyesX, EyesY）
-        eyes_x = (left_gaze_x + right_gaze_x) / 2
-        eyes_y = (left_gaze_y + right_gaze_y) / 2
-        
-        # 距離に依存しない目の開閉度検出（相対比ベース）
-        
-        # 目の縦横比で開閉度を判定（距離に依存しない）
-        left_aspect_ratio = left_eye_height / (left_eye_width + 1e-6)
-        right_aspect_ratio = right_eye_height / (right_eye_width + 1e-6)
-        
-        # シンプルな目の開閉検出
-        # 基準値設定（左右完全独立）
-        if not hasattr(self, 'eye_open_baseline'):
-            self.eye_open_baseline = {'left': left_aspect_ratio, 'right': right_aspect_ratio}
-            self.eye_closed_baseline = {'left': 0.05, 'right': 0.05}  # 完全に閉じた時の縦横比
-        
-        # 正常開眼時のみ基準値を更新
-        if left_aspect_ratio > 0.15:  # 左目が開いている時
-            self.eye_open_baseline['left'] = self.eye_open_baseline['left'] * 0.95 + left_aspect_ratio * 0.05
-        if right_aspect_ratio > 0.15:  # 右目が開いている時
-            self.eye_open_baseline['right'] = self.eye_open_baseline['right'] * 0.95 + right_aspect_ratio * 0.05
-        
-        # 左右完全独立な開閉度計算
-        def calculate_eyelid_simple(aspect_ratio, open_baseline, closed_baseline):
-            """シンプルな目の開閉度計算"""
-            if aspect_ratio >= open_baseline:
-                return 0.0  # 完全に開いている
-            elif aspect_ratio <= closed_baseline:
-                return 1.0  # 完全に閉じている
-            else:
-                # 線形補間
-                ratio = (open_baseline - aspect_ratio) / (open_baseline - closed_baseline + 1e-6)
-                return max(0.0, min(1.0, ratio))
-        
-        left_eyelid = calculate_eyelid_simple(left_aspect_ratio, 
-                                             self.eye_open_baseline['left'], 
-                                             self.eye_closed_baseline['left'])
-        right_eyelid = calculate_eyelid_simple(right_aspect_ratio, 
-                                              self.eye_open_baseline['right'], 
-                                              self.eye_closed_baseline['right'])
-        
-        # デバッグ出力
-        # print(f"Eye Debug - Left: ratio={left_aspect_ratio:.3f}, baseline={self.eye_open_baseline['left']:.3f}, eyelid={left_eyelid:.2f}")
-        # print(f"Eye Debug - Right: ratio={right_aspect_ratio:.3f}, baseline={self.eye_open_baseline['right']:.3f}, eyelid={right_eyelid:.2f}")
-        
-        # デバッグ用の目のパラメータを保存
-        self.last_eye_params = {
-            'left_eyelid': left_eyelid,
-            'right_eyelid': right_eyelid,
-            'left_ratio': left_aspect_ratio,
-            'right_ratio': right_aspect_ratio,
-            'left_width': left_eye_width,
-            'right_width': right_eye_width,
-            'left_height': left_eye_height,
-            'right_height': right_eye_height
+        """目のパラメータ - 動作しないため無効化"""
+        # 目のトラッキングが不安定なため、全て無効にする
+        return {
+            "EyesX": 0,
+            "EyesY": 0, 
+            "LeftEyeLid": 0,
+            "RightEyeLid": 0,
+            "EyesWiden": 0,
+            "EyeSquintLeft": 0,
+            "EyeSquintRight": 0,
+            "EyeWideLeft": 0,
+            "EyeWideRight": 0,
+            "BrowInnerUpLeft": 0,
+            "BrowInnerUpRight": 0,
+            "BrowLowererLeft": 0,
+            "BrowLowererRight": 0,
+            "BrowOuterUpLeft": 0,
+            "BrowOuterUpRight": 0
         }
-        
-        # 目の細め・見開き検出（縦横比ベース）
-        left_squint = max(0, min(1, (self.eye_open_baseline['left'] * 0.7 - left_aspect_ratio) * 10.0))
-        right_squint = max(0, min(1, (self.eye_open_baseline['right'] * 0.7 - right_aspect_ratio) * 10.0))
-        
-        # 目見開き検出
-        left_wide = max(0, min(1, (left_aspect_ratio - self.eye_open_baseline['left'] * 1.2) * 8.0))
-        right_wide = max(0, min(1, (right_aspect_ratio - self.eye_open_baseline['right'] * 1.2) * 8.0))
-        
-        # 全体の目を見開く
-        eyes_widen = (left_wide + right_wide) / 2
-        
-        # 眉毛のランドマーク
-        # 左眉毛: 70(外), 107(中), 55(内)
-        # 右眉毛: 285(外), 296(中), 334(内)
-        left_brow_inner = landmarks[55]   # 左眉内側
-        left_brow_middle = landmarks[107] # 左眉中央
-        left_brow_outer = landmarks[70]   # 左眉外側
-        right_brow_inner = landmarks[285] # 右眉内側
-        right_brow_middle = landmarks[296]# 右眉中央
-        right_brow_outer = landmarks[334] # 右眉外側
-        
-        # 眉毛の基準位置（目との相対位置）
-        left_brow_inner_height = (left_eye_top.y - left_brow_inner.y) * h
-        left_brow_outer_height = (left_eye_top.y - left_brow_outer.y) * h
-        right_brow_inner_height = (right_eye_top.y - right_brow_inner.y) * h
-        right_brow_outer_height = (right_eye_top.y - right_brow_outer.y) * h
-        
-        # 基準眉毛高さを設定
-        if not hasattr(self, 'base_brow_height'):
-            self.base_brow_height = {
-                'left_inner': left_brow_inner_height,
-                'left_outer': left_brow_outer_height,
-                'right_inner': right_brow_inner_height,
-                'right_outer': right_brow_outer_height
-            }
-        
-        # 眉毛の動きを計算（距離正規化対応）
-        brow_scale = 10 * scale_factor  # スケール調整された除数
-        brow_inner_up_left = max(0, (left_brow_inner_height - self.base_brow_height['left_inner']) / brow_scale)
-        brow_inner_up_right = max(0, (right_brow_inner_height - self.base_brow_height['right_inner']) / brow_scale)
-        brow_outer_up_left = max(0, (left_brow_outer_height - self.base_brow_height['left_outer']) / brow_scale)
-        brow_outer_up_right = max(0, (right_brow_outer_height - self.base_brow_height['right_outer']) / brow_scale)
-        
-        # 眉をひそめる（眉毛が下がる）- 距離正規化対応
-        brow_down_scale = 8 * scale_factor  # スケール調整された除数
-        brow_lowerer_left = max(0, (self.base_brow_height['left_inner'] - left_brow_inner_height) / brow_down_scale)
-        brow_lowerer_right = max(0, (self.base_brow_height['right_inner'] - right_brow_inner_height) / brow_down_scale)
-        
-        eye_params = {
-            "EyesX": max(-1, min(1, eyes_x)),
-            "EyesY": max(-1, min(1, eyes_y)),
-            "LeftEyeLid": max(0, min(1, left_eyelid)),
-            "RightEyeLid": max(0, min(1, right_eyelid)),
-            "EyesWiden": max(0, min(1, eyes_widen)),
-            "EyeSquintLeft": max(0, min(1, left_squint)),
-            "EyeSquintRight": max(0, min(1, right_squint)),
-            "EyeWideLeft": max(0, min(1, left_wide)),
-            "EyeWideRight": max(0, min(1, right_wide)),
-            # 眉毛パラメータ
-            "BrowInnerUpLeft": max(0, min(1, brow_inner_up_left)),
-            "BrowInnerUpRight": max(0, min(1, brow_inner_up_right)),
-            "BrowLowererLeft": max(0, min(1, brow_lowerer_left)),
-            "BrowLowererRight": max(0, min(1, brow_lowerer_right)),
-            "BrowOuterUpLeft": max(0, min(1, brow_outer_up_left)),
-            "BrowOuterUpRight": max(0, min(1, brow_outer_up_right))
-        }
-        
-        return eye_params
 
     def smooth_params(self, params):
         """パラメータのスムージング"""
@@ -954,20 +842,28 @@ class FacialTracker:
             # スムージング適用
             smoothed_params = self.smooth_params(calibrated_params)
             
-            # OSC送信とUI表示 - 2列に分けて表示
+            # OSC送信とUI表示 - 動作するパラメータのみ
             h, w, _ = frame.shape
             left_col_x = 10
             right_col_x = w // 2 + 10
             left_y = 60
             right_y = 60
             
-            # パラメータを2列に分けて表示
-            param_count = 0
-            # 無効化されたパラメータリスト（全て有効にするため空に）
-            disabled_params = set()
+            # 無効化されたパラメータリスト
+            disabled_params = {
+                'JawForward',  # 顎前方（動作しないため削除）
+                'CheekPuffRight', 'CheekPuffLeft',  # 頬膨らみ
+                'TongueOut', 'TongueUp', 'TongueDown', 'TongueRight', 'TongueLeft',  # 舌
+                'EyesX', 'EyesY', 'LeftEyeLid', 'RightEyeLid', 'EyesWiden',  # 目
+                'EyeSquintLeft', 'EyeSquintRight', 'EyeWideLeft', 'EyeWideRight',  # 目
+                'BrowInnerUpLeft', 'BrowInnerUpRight', 'BrowLowererLeft', 'BrowLowererRight',  # 眉毛
+                'BrowOuterUpLeft', 'BrowOuterUpRight'  # 眉毛
+            }
             
+            # パラメータを2列に分けて表示（動作するもののみ）
+            param_count = 0
             for key, val in smoothed_params.items():
-                if key in PARAMS and key not in disabled_params:  # 有効なパラメータのみ送信
+                if key in PARAMS and key not in disabled_params:  # 動作するパラメータのみ送信
                     self.osc_client.send_message(PARAMS[key], float(val))
                     color = (0, 255, 0) if abs(val) > 0.1 else (100, 100, 100)
                     
@@ -982,11 +878,9 @@ class FacialTracker:
                         right_y += 25
                     param_count += 1
             
-            # アイトラッキング状態表示（上部中央）
-            eye_status = "ON" if self.eye_tracking_enabled else "OFF"
-            eye_color = (0, 255, 0) if self.eye_tracking_enabled else (0, 0, 255)
-            cv2.putText(frame, f"Eye Tracking: {eye_status}", (w//2 - 120, 35),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, eye_color, 2)
+            # システム状態表示（上部中央）
+            cv2.putText(frame, f"Face Tracking: WORKING (Mouth/Jaw Only)", (w//2 - 180, 35),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
             # 口のランドマークを描画（デバッグ用）
             mouth_points = []
@@ -1045,39 +939,28 @@ class FacialTracker:
                 cv2.putText(frame, f"Face Scale: {scale_info['scale']:.1f}px", (w - 200, 110),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
-            # 重要パラメータを青い文字で表示（デバッグ用）
+            # 有効なパラメータのみデバッグ表示（青い文字）
             blue_color = (255, 0, 0)  # BGRなので青は(255,0,0)
             
-            if hasattr(self, 'last_eye_params'):
-                eye_params = self.last_eye_params
-                cv2.putText(frame, f"EYE DEBUG:", (10, h - 240),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, blue_color, 2)
-                cv2.putText(frame, f"Left Eye: Ratio={eye_params['left_ratio']:.3f} Lid={eye_params['left_eyelid']:.3f}", (10, h - 220),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
-                cv2.putText(frame, f"Right Eye: Ratio={eye_params['right_ratio']:.3f} Lid={eye_params['right_eyelid']:.3f}", (10, h - 200),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
-                cv2.putText(frame, f"Ratios: L={eye_params.get('left_ratio', 0):.3f} R={eye_params.get('right_ratio', 0):.3f}", (10, h - 180),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
-                cv2.putText(frame, f"H/W: L={eye_params.get('left_height', 0):.1f}/{eye_params.get('left_width', 0):.1f} R={eye_params.get('right_height', 0):.1f}/{eye_params.get('right_width', 0):.1f}", (10, h - 160),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, blue_color, 1)
-                cv2.putText(frame, f"Eye Tracking: {'ON' if self.eye_tracking_enabled else 'OFF (Press A)'}", (10, h - 140),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
-            
-            # 口と頬のパラメータも青い文字で表示
+            # 動作確認済みのパラメータのみ表示
             if hasattr(self, 'last_mouth_params'):
                 mouth_params = self.last_mouth_params
-                cv2.putText(frame, f"MOUTH & JAW DEBUG:", (300, h - 240),
+                cv2.putText(frame, f"WORKING PARAMETERS:", (10, h - 220),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, blue_color, 2)
-                cv2.putText(frame, f"Mouth Ratio: {mouth_params.get('mouth_ratio', 0):.3f} Open: N={mouth_params.get('is_open_normal', False)} S={mouth_params.get('is_open_strict', False)}", (300, h - 220),
+                cv2.putText(frame, f"Jaw Open: {mouth_params['jaw_open']:.3f}", (10, h - 200),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
+                cv2.putText(frame, f"Jaw L/R: {mouth_params.get('jaw_left', 0):.3f}/{mouth_params.get('jaw_right', 0):.3f}", (10, h - 180),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
+                cv2.putText(frame, f"Corner Pull L/R: {mouth_params['corner_left']:.3f}/{mouth_params['corner_right']:.3f}", (10, h - 160),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
+                cv2.putText(frame, f"Mouth Pucker: {mouth_params.get('pucker', 0):.3f}", (10, h - 140),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
+                cv2.putText(frame, f"Jaw Offset: {mouth_params.get('jaw_offset', 0):.3f} (L/R sensitivity: 7.0/8.0)", (10, h - 120),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, blue_color, 1)
-                cv2.putText(frame, f"Jaw Open: {mouth_params['jaw_open']:.3f} L/R: {mouth_params.get('jaw_left', 0):.3f}/{mouth_params.get('jaw_right', 0):.3f}", (300, h - 200),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
-                cv2.putText(frame, f"Cheek L/R: {mouth_params['cheek_left']:.3f}/{mouth_params['cheek_right']:.3f}", (300, h - 180),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
-                cv2.putText(frame, f"Corner Pull L/R: {mouth_params['corner_left']:.3f}/{mouth_params['corner_right']:.3f}", (300, h - 160),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
-                cv2.putText(frame, f"Mouth Stretch: {mouth_params['mouth_stretch']:.3f}", (300, h - 140),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, blue_color, 1)
+            
+            # 無効化されたパラメータの表示
+            cv2.putText(frame, f"DISABLED: JawForward, Eyes, CheekPuff, Tongue", (10, h - 100),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)  # 赤色で表示
             
             # 口の輪郭線を描画
             if len(mouth_points) >= 4:
