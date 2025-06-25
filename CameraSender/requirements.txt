@@ -1,0 +1,12 @@
+# CameraFacialTrackingModule - Python Dependencies
+# MediaPipeとの互換性を保つため、NumPy 2.x未満を指定
+
+# Core dependencies
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+python-osc>=1.8.0
+numpy<2.0.0
+scipy>=1.9.0
+
+# Additional utilities
+collections-extended>=2.0.0
