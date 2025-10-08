@@ -282,7 +282,6 @@ FakesAssemblies/
 *.GhostDoc.xml
 
 # Node.js Tools for Visual Studio
-.ntvs_analysis.dat
 node_modules/
 
 # Visual Studio 6 build log
@@ -399,3 +398,7 @@ FodyWeavers.xsd
 
 
 varjo/
+CameraSender/vr_mediapipe_env/
+VRCFaceTracking/
+CameraSender/.claude/
+CameraSender/venv/

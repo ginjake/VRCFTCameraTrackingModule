@@ -8,6 +8,22 @@ import numpy as np
 import math
 from collections import deque
 from scipy.spatial import distance
+import tkinter as tk
+from tkinter import ttk
+import threading
+import logging
+from PIL import Image, ImageDraw, ImageFont
+import signal
+import sys
+import atexit
+
+# Varjo競合対策のためのカメラ列挙（カメラを開かずにデバイスリストを取得）
+try:
+    from pygrabber.dshow_graph import FilterGraph
+    PYGRABBER_AVAILABLE = True
+except ImportError:
+    PYGRABBER_AVAILABLE = False
+    print("警告: pygrabberが利用できません。Varjo競合回避機能が制限されます。")
 
 # OSC設定
 OSC_IP = "127.0.0.1"
@@ -51,44 +67,51 @@ PARAMS = {
 }
 
 class FacialTracker:
-    def __init__(self):
+    def __init__(self, dual_camera=False):
         self.osc_client = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT)
+        self.dual_camera = dual_camera
         
-        # MediaPipe設定
+        # GUI用のボタン領域
+        self.buttons = {
+            'calibrate': {'x': 10, 'y': 10, 'width': 120, 'height': 40, 'text': 'Calibrate'},
+            'reset': {'x': 140, 'y': 10, 'width': 100, 'height': 40, 'text': 'Reset'},
+            'switch_camera': {'x': 250, 'y': 10, 'width': 140, 'height': 40, 'text': 'Switch Camera'}
+        }
+
+        # 日本語フォント設定
+        try:
+            # Windowsの標準日本語フォント
+            self.font = ImageFont.truetype("C:/Windows/Fonts/msgothic.ttc", 20)
+            self.font_large = ImageFont.truetype("C:/Windows/Fonts/msgothic.ttc", 30)
+            self.font_small = ImageFont.truetype("C:/Windows/Fonts/msgothic.ttc", 16)
+        except:
+            # フォールバック：デフォルトフォント
+            self.font = ImageFont.load_default()
+            self.font_large = ImageFont.load_default()
+            self.font_small = ImageFont.load_default()
+        
+        # MediaPipe設定（VRゴーグル対応・口周辺特化）
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
-            min_detection_confidence=0.01,  # 最低限界まで下げて超至近距離検出
-            min_tracking_confidence=0.01,   # 最小限で部分的顔も追跡
-            static_image_mode=False
+            min_detection_confidence=0.5,   # 負荷軽減のため高く設定
+            min_tracking_confidence=0.5,    # 負荷軽減のため高く設定
+            static_image_mode=False,
+            refine_landmarks=False          # 負荷軽減のため無効化（468点→68点）
         )
         
-        # スムージング用のバッファ（適応的サイズ）
+        # スムージング用のバッファ（カクカク防止・なめらかさ重視）
         self.smoothing_buffer = {}
         self.buffer_sizes = {
-            'JawOpen': 2,  # 口の開閉は少しスムーズに
-            'TongueOut': 1,  # 舌は瞬時反応
-            'TongueUp': 1,
-            'TongueDown': 1,
-            'TongueRight': 1,
-            'TongueLeft': 1,
-            'MouthCornerPullRight': 3,  # 口角は少しスムージング
+            'JawOpen': 3,  # なめらかさとレスポンスのバランス
+            'JawRight': 3,
+            'JawLeft': 3,
+            'MouthCornerPullRight': 3,
             'MouthCornerPullLeft': 3,
-            'MouthPucker': 2,  # 口すぼめは少しスムージング
-            'CheekPuffRight': 4,  # 頬膨らみは安定性重視
-            'CheekPuffLeft': 4,
-            'JawRight': 2,
-            'JawLeft': 2,
-            'JawForward': 2,
-            # アイトラッキング用
-            'LeftEyeLid': 2,
-            'RightEyeLid': 2,
-            'EyesX': 3,
-            'EyesY': 3
+            'MouthPucker': 3
         }
-        for param in PARAMS.keys():
-            buffer_size = self.buffer_sizes.get(param, 5)
-            self.smoothing_buffer[param] = deque(maxlen=buffer_size)
+        for param in self.buffer_sizes.keys():
+            self.smoothing_buffer[param] = deque(maxlen=self.buffer_sizes[param])
         
         # 動的キャリブレーションシステム
         self.baseline = {}  # 安静時の基準値
@@ -150,46 +173,61 @@ class FacialTracker:
         self.prev_gray = None
         self.prev_cheek_points = None
         self.cheek_movement_history = deque(maxlen=10)
+        
+        # 2台カメラ用の追加設定
+        if self.dual_camera:
+            self.prev_gray_secondary = None
+            self.secondary_camera_offset = 10  # 10cm間隔
+            self.stereo_depth_enabled = True
+            
+            # ステレオ視用の設定
+            self.stereo_matcher = cv2.StereoBM_create(numDisparities=64, blockSize=15)
+            
+            # 頬・舌専用の高精度検出用バッファ
+            self.cheek_stereo_buffer = deque(maxlen=5)
+            self.tongue_stereo_buffer = deque(maxlen=3)
+            
+            # 3D座標計算用
+            self.camera_distance = 0.1  # 10cm
+            self.focal_length_mm = 2.8  # 一般的なウェブカメラ
+            
+        # VRゴーグル対応（目を使わない設定）
+        self.vr_mode = True  # VRゴーグル着用時は目の検出を無効化
+        self.focus_on_lower_face = True  # 口元・頬・舌に特化
 
-    def calibrate(self, landmarks, w, h, rgb):
-        """改善されたキャリブレーションシステム"""
+    def put_japanese_text(self, img, text, position, font, color=(255, 255, 255)):
+        """OpenCVの画像に日本語テキストを描画"""
+        # OpenCV形式(BGR)からPIL形式(RGB)に変換
+        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+        draw.text(position, text, font=font, fill=color[::-1])  # BGRからRGBに変換
+        # PIL形式からOpenCV形式に戻す
+        return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+    def calibrate(self, landmarks, w, h):
+        """軽量化されたキャリブレーションシステム"""
         if self.calibration_frames < 60:  # 2秒間で基準値を収集
-            params = self.calculate_raw_params(landmarks, w, h, rgb)
+            params = self.calculate_raw_params_lightweight(landmarks, w, h)
             
-            # 顔の基本情報を収集
-            mouth_width = abs(landmarks[61].x - landmarks[291].x) * w
-            mouth_height = abs(landmarks[13].y - landmarks[14].y) * h
-            face_width = abs(landmarks[234].x - landmarks[454].x) * w
-            
-            # 個人差のパラメータを計算
-            if self.calibration_frames == 0:
-                self.face_scale_factor = face_width / 100.0  # 基準サイズ100px
-                self.mouth_aspect_ratio = mouth_height / (mouth_width + 1e-6)
-            
-            # パラメータの基準値を収集
-            for key, val in params.items():
-                if key in self.baseline:  # 初期化済みのパラメータのみ処理
-                    self.baseline[key].append(val)
+            # 軽量化：最小限のキャリブレーション
+            # JawOpenの基準値のみ収集
+            if 'JawOpen' in params and params['JawOpen'] > 0:
+                if not hasattr(self, 'baseline_jaw_samples'):
+                    self.baseline_jaw_samples = []
+                self.baseline_jaw_samples.append(params['JawOpen'])
             
             self.calibration_frames += 1
             return False
         else:
-            # 平均値を基準として設定
-            for key in self.baseline:
-                if isinstance(self.baseline[key], list) and len(self.baseline[key]) > 0:
-                    values = self.baseline[key]
-                    # 外れ値を除去して平均を計算
-                    sorted_values = sorted(values)
-                    trim_count = len(sorted_values) // 10  # 上下10%をカット
-                    if trim_count > 0:
-                        trimmed_values = sorted_values[trim_count:-trim_count]
-                    else:
-                        trimmed_values = sorted_values
-                    self.baseline[key] = np.mean(trimmed_values)
-                # リストでない場合（初期値0.0）はそのまま維持
+            # JawOpenの基準値設定
+            if hasattr(self, 'baseline_jaw_samples') and len(self.baseline_jaw_samples) > 10:
+                # 最小値を基準として使用（口を閉じた状態）
+                jaw_baseline = min(self.baseline_jaw_samples)
+                if hasattr(self, 'jaw_open_baseline'):
+                    self.jaw_open_baseline = jaw_baseline
             
             self.calibration_needed = False
-            print(f"Calibration completed. Face scale: {self.face_scale_factor:.2f}, Mouth ratio: {self.mouth_aspect_ratio:.2f}")
+            print("Lightweight calibration completed!")
             return True
 
     def get_rotated_point(self, cx, cy, x, y, angle):
@@ -256,46 +294,255 @@ class FacialTracker:
         
         return {'success': False}
     
-    def detect_cheek_puff_optical_flow(self, gray_frame, landmarks, w, h):
-        """シンプル頬膨らみ検出"""
-        # 主要な頬ランドマーク（最も確実なポイント）
-        left_cheek = landmarks[234]   # 左頬の中心
-        right_cheek = landmarks[454]  # 右頬の中心
-        face_center_x = (left_cheek.x + right_cheek.x) * w / 2
-        
-        # 現在の頬の位置
-        left_x = left_cheek.x * w
-        right_x = right_cheek.x * w
-        current_width = abs(right_x - left_x)
-        
-        # 基準値設定
-        if not hasattr(self, 'base_cheek_positions'):
-            self.base_cheek_positions = {
-                'left_x': left_x,
-                'right_x': right_x,
-                'width': current_width,
-                'center_x': face_center_x
+    def detect_cheek_puff_stereo(self, landmarks_primary, landmarks_secondary, w_primary, h_primary, w_secondary, h_secondary):
+        """ステレオカメラによる高精度頬膨らみ検出"""
+        try:
+            # プライマリカメラの頬ポイント
+            left_cheek_p = landmarks_primary[234]
+            right_cheek_p = landmarks_primary[454]
+            
+            # セカンダリカメラの頬ポイント
+            left_cheek_s = landmarks_secondary[234]
+            right_cheek_s = landmarks_secondary[454]
+            
+            # ステレオ視による3D座標計算
+            # 視差計算（2台のカメラ間での位置差）
+            left_disparity = abs((left_cheek_p.x * w_primary) - (left_cheek_s.x * w_secondary))
+            right_disparity = abs((right_cheek_p.x * w_primary) - (right_cheek_s.x * w_secondary))
+            
+            # 基準視差を保存
+            if not hasattr(self, 'base_cheek_disparity'):
+                self.base_cheek_disparity = {
+                    'left': left_disparity,
+                    'right': right_disparity
+                }
+            
+            # 膨らみによる視差変化を検出
+            left_depth_change = (left_disparity - self.base_cheek_disparity['left']) / (self.base_cheek_disparity['left'] + 1e-6)
+            right_depth_change = (right_disparity - self.base_cheek_disparity['right']) / (self.base_cheek_disparity['right'] + 1e-6)
+            
+            # 膨らみ強度計算（前方への突出）
+            left_puff = max(0, min(1.0, left_depth_change * 20.0))
+            right_puff = max(0, min(1.0, right_depth_change * 20.0))
+            
+            return left_puff, right_puff
+            
+        except (IndexError, AttributeError):
+            # フォールバック：単一カメラでの検出
+            return self.detect_cheek_puff_optical_flow_single(landmarks_primary, w_primary, h_primary)
+
+    def detect_cheek_puff_optical_flow_single(self, landmarks, w, h):
+        """単一カメラ用頬膨らみ検出（大幅改良版）"""
+        try:
+            # より多くの頬ランドマークを使用
+            left_cheek_main = landmarks[234]   # 左頬の中心
+            right_cheek_main = landmarks[454]  # 右頬の中心
+            
+            # 顔の基準線（鼻筋）
+            nose_bridge_top = landmarks[6]     # 鼻筋上部
+            nose_bridge_bottom = landmarks[2]  # 鼻筋下部
+            face_center_line_x = (nose_bridge_top.x + nose_bridge_bottom.x) * w / 2
+            
+            # 詳細な頬ポイント（輪郭を含む）
+            left_cheek_detailed = [landmarks[i] for i in [116, 117, 118, 119, 120, 121, 126, 142, 36, 205, 206, 207, 213, 192, 147, 234, 227, 137]]
+            right_cheek_detailed = [landmarks[i] for i in [345, 346, 347, 348, 349, 350, 355, 371, 266, 425, 426, 427, 436, 416, 376, 454, 447, 366]]
+            
+            # 頬の幅（顔の外側への膨らみ）を測定
+            left_cheek_outer_x = min([p.x * w for p in left_cheek_detailed])  # 最も左のポイント
+            right_cheek_outer_x = max([p.x * w for p in right_cheek_detailed]) # 最も右のポイント
+            
+            # 基準幅を設定
+            if not hasattr(self, 'base_cheek_width'):
+                self.base_cheek_width = {
+                    'left_distance': abs(face_center_line_x - left_cheek_outer_x),
+                    'right_distance': abs(right_cheek_outer_x - face_center_line_x),
+                    'total_width': abs(right_cheek_outer_x - left_cheek_outer_x)
+                }
+            
+            # 現在の頬の外側への膨らみを計算
+            current_left_distance = abs(face_center_line_x - left_cheek_outer_x)
+            current_right_distance = abs(right_cheek_outer_x - face_center_line_x)
+            
+            # 膨らみ率を計算
+            left_expansion_ratio = (current_left_distance - self.base_cheek_width['left_distance']) / (self.base_cheek_width['left_distance'] + 1e-6)
+            right_expansion_ratio = (current_right_distance - self.base_cheek_width['right_distance']) / (self.base_cheek_width['right_distance'] + 1e-6)
+            
+            # 頬の面積による膨らみ検出も併用
+            left_area = self.calculate_cheek_area(left_cheek_detailed, w, h)
+            right_area = self.calculate_cheek_area(right_cheek_detailed, w, h)
+            
+            if not hasattr(self, 'base_cheek_areas'):
+                self.base_cheek_areas = {
+                    'left': left_area,
+                    'right': right_area
+                }
+            
+            # 面積変化
+            left_area_expansion = (left_area - self.base_cheek_areas['left']) / (self.base_cheek_areas['left'] + 1e-6)
+            right_area_expansion = (right_area - self.base_cheek_areas['right']) / (self.base_cheek_areas['right'] + 1e-6)
+            
+            # 幅と面積の両方を考慮した膨らみ検出
+            left_puff_width = max(0, left_expansion_ratio * 25.0)   # 幅による検出
+            right_puff_width = max(0, right_expansion_ratio * 25.0)
+            
+            left_puff_area = max(0, left_area_expansion * 20.0)     # 面積による検出
+            right_puff_area = max(0, right_area_expansion * 20.0)
+            
+            # より強い方を採用
+            left_puff = min(1.0, max(left_puff_width, left_puff_area))
+            right_puff = min(1.0, max(right_puff_width, right_puff_area))
+            
+            # デバッグ情報を保存
+            self.cheek_debug_info = {
+                'left_expansion_ratio': left_expansion_ratio,
+                'right_expansion_ratio': right_expansion_ratio,
+                'left_area_expansion': left_area_expansion,
+                'right_area_expansion': right_area_expansion,
+                'left_puff_final': left_puff,
+                'right_puff_final': right_puff,
+                'face_center_x': face_center_line_x
             }
+            
+            return left_puff, right_puff
+            
+        except (IndexError, AttributeError, ZeroDivisionError):
+            return 0, 0
+    
+    def calculate_cheek_area(self, cheek_points, w, h):
+        """頬の面積を計算"""
+        if len(cheek_points) < 3:
+            return 0
         
-        # 各頬の中心からの距離変化
-        base_left_distance = abs(self.base_cheek_positions['left_x'] - self.base_cheek_positions['center_x'])
-        base_right_distance = abs(self.base_cheek_positions['right_x'] - self.base_cheek_positions['center_x'])
+        # 2D座標に変換
+        points = np.array([(p.x * w, p.y * h) for p in cheek_points], dtype=np.float32)
         
-        current_left_distance = abs(left_x - face_center_x)
-        current_right_distance = abs(right_x - face_center_x)
+        # 凸包を計算して面積取得
+        hull = cv2.convexHull(points)
+        area = cv2.contourArea(hull)
         
-        # 膨らみ検出（外向きの移動）
-        left_expansion = (current_left_distance - base_left_distance) / (base_left_distance + 1e-6)
-        right_expansion = (current_right_distance - base_right_distance) / (base_right_distance + 1e-6)
+        return area
+    
+    def detect_tongue_stereo(self, landmarks_primary, landmarks_secondary, w, h, mouth_very_open, mouth_center_x, mouth_width, mouth_height, precise_mouth_height, get_rotated):
+        """ステレオカメラによる高精度舌検出"""
+        if not mouth_very_open:
+            return {'x_displacement': 0, 'protrusion': 0, 'up': 0, 'down': 0}
         
-        # 高感度変換（0-1範囲）
-        left_puff = max(0, min(1.0, left_expansion * 50.0))  # 高感度
-        right_puff = max(0, min(1.0, right_expansion * 50.0))
+        try:
+            # プライマリとセカンダリの舌ポイント
+            tongue_tip_p = landmarks_primary[17]
+            tongue_tip_s = landmarks_secondary[17]
+            
+            # ステレオ視による舌の3D位置推定
+            tongue_disparity = abs((tongue_tip_p.x * w) - (tongue_tip_s.x * w))
+            
+            # 基準視差
+            if not hasattr(self, 'base_tongue_disparity'):
+                self.base_tongue_disparity = tongue_disparity
+            
+            # 舌の前後移動（突出）
+            depth_change = (tongue_disparity - self.base_tongue_disparity) / (self.base_tongue_disparity + 1e-6)
+            tongue_protrusion = max(0, min(1.0, depth_change * 25.0))
+            
+            # 従来の2D検出も併用
+            single_result = self.detect_tongue_single(landmarks_primary, w, h, mouth_very_open, mouth_center_x, mouth_width, mouth_height, precise_mouth_height, get_rotated)
+            
+            # ステレオと2Dの結果を合成
+            return {
+                'x_displacement': single_result['x_displacement'],
+                'protrusion': max(tongue_protrusion, single_result['protrusion']),
+                'up': single_result['up'],
+                'down': single_result['down']
+            }
+            
+        except (IndexError, AttributeError):
+            # フォールバック
+            return self.detect_tongue_single(landmarks_primary, w, h, mouth_very_open, mouth_center_x, mouth_width, mouth_height, precise_mouth_height, get_rotated)
+    
+    def detect_tongue_single(self, landmarks, w, h, mouth_very_open, mouth_center_x, mouth_width, mouth_height, precise_mouth_height, get_rotated):
+        """単一カメラでの舌検出（大幅改良版）"""
+        # 口の開き具合をより詳細にチェック
+        mouth_aspect_ratio = precise_mouth_height / (mouth_width + 1e-6)
+        mouth_open_enough = mouth_aspect_ratio > 0.06  # より低い閾値
         
-        # デバッグ用に値を確認
-        # print(f"CheekPuff Debug - Left: {left_expansion:.4f} -> {left_puff:.2f}, Right: {right_expansion:.4f} -> {right_puff:.2f}")
+        if not mouth_open_enough:
+            return {'x_displacement': 0, 'protrusion': 0, 'up': 0, 'down': 0}
         
-        return left_puff, right_puff
+        # 舌関連のより多くのランドマーク
+        try:
+            tongue_tip = get_rotated(17)  # 舌先
+            lower_lip_center = get_rotated(14)  # 下唇中央
+            upper_lip_center = get_rotated(13)  # 上唇中央
+            
+            # 口の内側の基準点
+            mouth_left_inner = get_rotated(78)   # 口の左内側
+            mouth_right_inner = get_rotated(308) # 口の右内側
+            
+            # 舌の中央位置計算
+            mouth_inner_center_x = (mouth_left_inner[0] + mouth_right_inner[0]) / 2
+            mouth_inner_center_y = (upper_lip_center[1] + lower_lip_center[1]) / 2
+            
+            # 舌の左右移動（改良版）
+            tongue_x_offset = (tongue_tip[0] - mouth_inner_center_x) / (mouth_width + 1e-6)
+            
+            # より小さなデッドゾーンと高感度
+            tongue_deadzone = 0.03  # 3%まで削減
+            
+            if abs(tongue_x_offset) > tongue_deadzone:
+                # 左右の感度を大幅アップ
+                tongue_x_displacement = (tongue_x_offset - math.copysign(tongue_deadzone, tongue_x_offset)) * 12.0
+            else:
+                tongue_x_displacement = 0
+                
+            # 舌の突出度（大幅改良）
+            # 舌先と下唇の距離をより正確に
+            lip_baseline_y = lower_lip_center[1]
+            tongue_y = tongue_tip[1]
+            
+            # 舌が口から出ているかの判定（より精密）
+            lip_to_tongue_distance = (tongue_y - lip_baseline_y) / (precise_mouth_height + 1e-6)
+            
+            # 突出検出の感度を上げる
+            tongue_protrusion = 0
+            if lip_to_tongue_distance > 0.05:  # 5%以上下に出ていれば検出
+                tongue_protrusion = min(1.0, lip_to_tongue_distance * 15.0)
+            
+            # 舌の上下動作（大幅改良）
+            # 舌が上に動く場合
+            upper_baseline_y = upper_lip_center[1]
+            tongue_up_distance = (upper_baseline_y - tongue_y) / (precise_mouth_height + 1e-6)
+            
+            tongue_up = 0
+            if tongue_up_distance > 0.1:  # 上唇に近づく
+                tongue_up = min(1.0, (tongue_up_distance - 0.1) * 10.0)
+            
+            # 舌が下に動く場合（突出とは別）
+            tongue_down_distance = (tongue_y - mouth_inner_center_y) / (precise_mouth_height + 1e-6)
+            
+            tongue_down = 0
+            if tongue_down_distance > 0.15:  # 口の中央より下
+                tongue_down = min(1.0, (tongue_down_distance - 0.15) * 8.0)
+            
+            # デバッグ情報を保存
+            self.tongue_debug_info = {
+                'mouth_open': mouth_open_enough,
+                'mouth_ratio': mouth_aspect_ratio,
+                'x_offset': tongue_x_offset,
+                'protrusion_raw': lip_to_tongue_distance,
+                'up_distance': tongue_up_distance,
+                'down_distance': tongue_down_distance,
+                'tongue_pos': [tongue_tip[0], tongue_tip[1]],
+                'mouth_center': [mouth_inner_center_x, mouth_inner_center_y]
+            }
+            
+            return {
+                'x_displacement': min(max(tongue_x_displacement, -1), 1),
+                'protrusion': min(max(tongue_protrusion, 0), 1),
+                'up': min(max(tongue_up, 0), 1),
+                'down': min(max(tongue_down, 0), 1)
+            }
+            
+        except (IndexError, AttributeError):
+            return {'x_displacement': 0, 'protrusion': 0, 'up': 0, 'down': 0}
     
     def update_baseline_adaptively(self, params):
         """適応的な基準値更新"""
@@ -368,13 +615,144 @@ class FacialTracker:
         
         return orientation
 
-    def calculate_raw_params(self, landmarks, w, h, rgb):
-        """生の顔パラメータを計算（距離正規化対応）"""
+    def calculate_raw_params_lightweight(self, landmarks, w, h):
+        """軽量化：JawOpenと基本的な口の動きのみ計算"""
         def get_xy(idx):
             return landmarks[idx].x * w, landmarks[idx].y * h
         
-        def get_xyz(idx):
-            return landmarks[idx].x * w, landmarks[idx].y * h, landmarks[idx].z
+        # 超至近距離・顎下からの画角に特化したJawOpen計算
+
+        # 重要なランドマークのみ使用（軽量化）
+        upper_lip = get_xy(13)      # 上唇中央
+        lower_lip = get_xy(14)      # 下唇中央
+        left_corner = get_xy(61)    # 左口角
+        right_corner = get_xy(291)  # 右口角
+        chin = get_xy(18)           # 顎先
+
+        # 口の基本寸法
+        mouth_width = abs(right_corner[0] - left_corner[0])
+
+        # 唇の距離（純粋な縦方向のみ）
+        lip_distance = abs(upper_lip[1] - lower_lip[1])
+
+        # 顎先から上唇までの距離を正規化
+        chin_to_upper_lip = abs(chin[1] - upper_lip[1])
+        jaw_open_ratio = lip_distance / (chin_to_upper_lip + 1e-6)
+
+        # キャリブレーション中は基準値を記録
+        if self.calibration_needed:
+            if not hasattr(self, 'jaw_baseline_buffer'):
+                self.jaw_baseline_buffer = []
+
+            self.jaw_baseline_buffer.append(jaw_open_ratio)
+
+            # キャリブレーション完了時に基準値を確定
+            if self.calibration_frames >= 60:
+                self.jaw_open_baseline = np.mean(self.jaw_baseline_buffer)
+                self.jaw_baseline_buffer = []
+
+        # 基準値が設定されていない場合は現在値を使用
+        if not hasattr(self, 'jaw_open_baseline'):
+            self.jaw_open_baseline = jaw_open_ratio
+
+        # JawOpen計算（デッドゾーン付き）
+        jaw_open_change = jaw_open_ratio - self.jaw_open_baseline
+
+        # デッドゾーン: 小さな変化は無視
+        jaw_deadzone = 0.015  # 少し大きめに設定
+        if abs(jaw_open_change) < jaw_deadzone:
+            jaw_open_change = 0
+        else:
+            jaw_open_change = jaw_open_change - math.copysign(jaw_deadzone, jaw_open_change)
+
+        # 口角が上がっている時は、誤検出を防ぐため感度を下げる
+        corner_height_avg = (left_corner[1] + right_corner[1]) / 2
+        mouth_center_y = (upper_lip[1] + lower_lip[1]) / 2
+
+        # 口角が口の中心より上にある場合（笑顔など）
+        if corner_height_avg < mouth_center_y:
+            # 感度を50%に減らす
+            jaw_open_change *= 0.5
+
+        jaw_open = max(0, min(1.0, jaw_open_change * 15.0))
+        
+        # 顎の左右移動（簡素化）
+        face_center_x = (left_corner[0] + right_corner[0]) / 2
+        jaw_offset = (chin[0] - face_center_x) / (mouth_width + 1e-6)
+        
+        # デッドゾーン適用
+        jaw_deadzone = 0.02
+        if abs(jaw_offset) > jaw_deadzone:
+            jaw_displacement = (jaw_offset - math.copysign(jaw_deadzone, jaw_offset)) * 8.0
+        else:
+            jaw_displacement = 0
+        
+        # 口角の動き（キャリブレーションベース）
+        # mouth_center_yは上で既に計算済み
+
+        # キャリブレーション中は基準値を記録
+        if self.calibration_needed:
+            if not hasattr(self, 'corner_baseline_buffer'):
+                self.corner_baseline_buffer = {'left': [], 'right': []}
+
+            self.corner_baseline_buffer['left'].append(left_corner[1])
+            self.corner_baseline_buffer['right'].append(right_corner[1])
+
+            # キャリブレーション完了時に基準値を確定
+            if self.calibration_frames >= 60:
+                self.baseline_left_corner_y = np.mean(self.corner_baseline_buffer['left'])
+                self.baseline_right_corner_y = np.mean(self.corner_baseline_buffer['right'])
+                self.corner_baseline_buffer = {'left': [], 'right': []}
+
+        # 基準値が設定されていない場合は現在値を使用
+        if not hasattr(self, 'baseline_left_corner_y'):
+            self.baseline_left_corner_y = left_corner[1]
+            self.baseline_right_corner_y = right_corner[1]
+
+        # 基準値からの変化量を計算
+        left_corner_change = (self.baseline_left_corner_y - left_corner[1])
+        right_corner_change = (self.baseline_right_corner_y - right_corner[1])
+
+        # デッドゾーン: 小さな変化は無視（ノイズ対策）
+        corner_deadzone = mouth_width * 0.02  # 口の幅の2%
+
+        if abs(left_corner_change) < corner_deadzone:
+            left_corner_change = 0
+        else:
+            left_corner_change = left_corner_change - math.copysign(corner_deadzone, left_corner_change)
+
+        if abs(right_corner_change) < corner_deadzone:
+            right_corner_change = 0
+        else:
+            right_corner_change = right_corner_change - math.copysign(corner_deadzone, right_corner_change)
+
+        # 口の幅で正規化
+        left_corner_pull = max(0, min(1, left_corner_change / (mouth_width * 0.08 + 1e-6)))
+        right_corner_pull = max(0, min(1, right_corner_change / (mouth_width * 0.08 + 1e-6)))
+        
+        # 口すぼめ（簡素化）
+        inner_width = mouth_width * 0.7  # 簡易計算
+        pucker = max(0, (mouth_width - inner_width) / mouth_width * 2.0)
+        
+        return {
+            "JawOpen": min(max(jaw_open, 0), 1),
+            "JawRight": min(max(jaw_displacement, 0), 1) if jaw_displacement > 0 else 0,
+            "JawLeft": min(max(-jaw_displacement, 0), 1) if jaw_displacement < 0 else 0,
+            "MouthCornerPullRight": min(max(right_corner_pull, 0), 1),
+            "MouthCornerPullLeft": min(max(left_corner_pull, 0), 1),
+            "MouthPucker": min(max(pucker, 0), 1),
+            # 不要な機能は全て0
+            "JawForward": 0,
+            "CheekPuffRight": 0,
+            "CheekPuffLeft": 0,
+            "TongueOut": 0,
+            "TongueUp": 0,
+            "TongueDown": 0,
+            "TongueRight": 0,
+            "TongueLeft": 0,
+            "NoseSneerLeft": 0,
+            "NoseSneerRight": 0
+        }
         
         # 顔のスケール計算（距離正規化の基準）
         left_cheek = landmarks[234]
@@ -614,8 +992,12 @@ class FacialTracker:
         # グレースケール変換
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         
-        # 光学フローベースの頬膨らみ検出
-        left_cheek_expansion, right_cheek_expansion = self.detect_cheek_puff_optical_flow(gray, landmarks, w, h)
+        # ステレオカメラ対応の頬膨らみ検出
+        if self.dual_camera and hasattr(self, 'secondary_landmarks'):
+            left_cheek_expansion, right_cheek_expansion = self.detect_cheek_puff_stereo(
+                landmarks, self.secondary_landmarks, w, h, w, h)
+        else:
+            left_cheek_expansion, right_cheek_expansion = self.detect_cheek_puff_optical_flow_single(landmarks, w, h)
         
         # 従来手法との組み合わせ（フォールバック）
         if left_cheek_expansion == 0 and right_cheek_expansion == 0:
@@ -635,7 +1017,7 @@ class FacialTracker:
             left_cheek_expansion = max(0, (left_cheek_protrusion - 0.9) * 8.0)
             right_cheek_expansion = max(0, (right_cheek_protrusion - 0.9) * 8.0)
         
-        # パラメータの計算と正規化（確実に動作する部分のみ）
+        # パラメータの計算と正規化（舌・頬機能を無効化）
         params = {
             "JawOpen": min(max(jaw_open_factor, 0), 1),  # 口の開閉 - 動作確認済み
             "JawRight": min(max(jaw_displacement_x_raw, 0), 1),  # 顎右 - 動作確認済み
@@ -644,7 +1026,7 @@ class FacialTracker:
             "MouthCornerPullRight": min(max(right_corner_pull * 3, 0), 1),  # 右口角 - 動作確認済み
             "MouthCornerPullLeft": min(max(left_corner_pull * 3, 0), 1),  # 左口角 - 動作確認済み
             "MouthPucker": min(max(pucker_intensity, 0), 1),  # 口すぼめ - 動作確認済み
-            # 以下は動作しないため無効化
+            # 頬・舌機能を無効化
             "CheekPuffRight": 0,  # 無効化
             "CheekPuffLeft": 0,   # 無効化
             "TongueOut": 0,       # 無効化
@@ -775,19 +1157,114 @@ class FacialTracker:
             smoothed[key] = np.mean(list(self.smoothing_buffer[key]))
         return smoothed
 
+    def process_dual_frame(self, frame_primary, frame_secondary=None):
+        """2台カメラフレームを処理してOSCデータを送信"""
+        # プライマリカメラの処理
+        rgb_primary = cv2.cvtColor(frame_primary, cv2.COLOR_BGR2RGB)
+        h, w, _ = frame_primary.shape
+        
+        results_primary = self.face_mesh_primary.process(rgb_primary)
+        
+        # セカンダリカメラの処理（利用可能な場合）
+        results_secondary = None
+        if self.dual_camera and frame_secondary is not None:
+            rgb_secondary = cv2.cvtColor(frame_secondary, cv2.COLOR_BGR2RGB)
+            results_secondary = self.face_mesh_secondary.process(rgb_secondary)
+            if results_secondary.multi_face_landmarks:
+                self.secondary_landmarks = results_secondary.multi_face_landmarks[0].landmark
+        
+        return self.process_landmarks(frame_primary, results_primary, w, h)
+    
     def process_frame(self, frame):
-        """フレームを処理してOSCデータを送信"""
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        """単一カメラ用のフレーム処理（VRゴーグル対応：顔下半分専用）"""
+        h, w, _ = frame.shape
+
+        # カメラが上下逆さなので反転（VRゴーグル装着時）
+        frame_flipped = cv2.flip(frame, -1)  # 上下左右反転
+
+        # VRゴーグル対応：画像を上に拡張して顔全体に見せかける
+        # MediaPipeは顔全体が必要なため、画像の上部を黒で埋めて拡張
+        expanded_height = int(h * 2.5)  # より大きく拡張
+        expanded_frame = np.zeros((expanded_height, w, 3), dtype=np.uint8)
+        # 元の画像を下部に配置
+        y_offset = expanded_height - h
+        expanded_frame[y_offset:, :] = frame_flipped
+
+        # 画像前処理：検出率向上のため
+        # 1. ノイズ除去
+        frame_processed = cv2.bilateralFilter(expanded_frame, 5, 50, 50)
+
+        # 2. CLAHE（コントラスト制限適応ヒストグラム平坦化）
+        yuv = cv2.cvtColor(frame_processed, cv2.COLOR_BGR2YUV)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        yuv[:, :, 0] = clahe.apply(yuv[:, :, 0])
+        frame_enhanced = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+
+        # MediaPipe用にRGBに変換
+        rgb = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2RGB)
+
+        # MediaPipe処理
+        results = self.face_mesh.process(rgb)
+
+        # ランドマークのY座標を調整（元の画像座標系に戻す）
+        if results.multi_face_landmarks:
+            for landmarks in results.multi_face_landmarks:
+                for landmark in landmarks.landmark:
+                    # Y座標を元の画像座標系に戻す
+                    landmark.y = (landmark.y * expanded_height - y_offset) / h
+
+        # 反転後のフレームで描画
+        return self.process_landmarks(frame_flipped, results, w, h)
+    
+    def draw_buttons(self, frame):
+        """画面上部にボタンを描画"""
         h, w, _ = frame.shape
         
-        results = self.face_mesh.process(rgb)
+        for button_name, button in self.buttons.items():
+            x, y, width, height = button['x'], button['y'], button['width'], button['height']
+            text = button['text']
+            
+            # ボタンの背景
+            color = (50, 150, 50) if button_name == 'calibrate' else (100, 100, 100)
+            if hasattr(self, 'button_hover') and self.button_hover == button_name:
+                color = (80, 180, 80) if button_name == 'calibrate' else (130, 130, 130)
+            
+            cv2.rectangle(frame, (x, y), (x + width, y + height), color, -1)
+            cv2.rectangle(frame, (x, y), (x + width, y + height), (255, 255, 255), 2)
+            
+            # ボタンのテキスト
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            text_x = x + (width - text_size[0]) // 2
+            text_y = y + (height + text_size[1]) // 2
+            
+            cv2.putText(frame, text, (text_x, text_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        return frame
+    
+    def check_button_click(self, x, y):
+        """ボタンクリックの判定"""
+        for button_name, button in self.buttons.items():
+            if (button['x'] <= x <= button['x'] + button['width'] and
+                button['y'] <= y <= button['y'] + button['height']):
+                return button_name
+        return None
+    
+    def process_landmarks(self, frame, results, w, h):
+        """ランドマーク処理の共通ロジック"""
+        
+        # ボタンを描画
+        frame = self.draw_buttons(frame)
         
         if results.multi_face_landmarks:
             landmarks = results.multi_face_landmarks[0].landmark
             
+            # RGB変換（キャリブレーション用）
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
             # キャリブレーション中
             if self.calibration_needed:
-                calibrated = self.calibrate(landmarks, w, h, rgb)
+                calibrated = self.calibrate(landmarks, w, h)
                 if calibrated:
                     cv2.putText(frame, "Calibration Complete!", (10, 30),
                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -804,40 +1281,13 @@ class FacialTracker:
             face_height = abs(landmarks[10].y - landmarks[152].y) * h
             face_scale = (face_width + face_height) / 2
             
-            # パラメータ計算
-            raw_params = self.calculate_raw_params(landmarks, w, h, rgb)
+            # パラメータ計算（軽量版）
+            raw_params = self.calculate_raw_params_lightweight(landmarks, w, h)
             
-            # 鼻パラメータを追加
-            nose_params = self.calculate_nose_params(landmarks, w, h)
-            raw_params.update(nose_params)
+            # 不要な機能は削除（軽量化）
             
-            # アイトラッキングパラメータを追加（スケール情報を渡す）
-            eye_params = self.calculate_eye_params(landmarks, w, h, face_scale)
-            raw_params.update(eye_params)
-            
-            # 適応的基準値更新
-            self.update_baseline_adaptively(raw_params)
-            
-            # キャリブレーション基準値から差分を計算
-            calibrated_params = {}
-            for key, val in raw_params.items():
-                if key in self.baseline and isinstance(self.baseline[key], (int, float)):
-                    # 基準値からの変化を計算（数値の基準値がある場合のみ）
-                    if key in ["JawOpen", "TongueOut", "TongueUp", "TongueDown", "CheekPuffRight", "CheekPuffLeft"]:
-                        # 基準値からの差分で計算し、マイナス値を防ぐ
-                        diff = val - self.baseline[key]
-                        # 個人差を考慮したスケーリング
-                        if key.startswith("Cheek"):
-                            diff *= self.face_scale_factor
-                        calibrated_params[key] = max(diff, 0)
-                    elif key == "JawForward":
-                        # JawForwardも基準値からの差分で計算
-                        calibrated_params[key] = max(val - self.baseline[key], 0)
-                    else:
-                        calibrated_params[key] = val
-                else:
-                    # 基準値がない場合や顎の左右は生の値をそのまま使用
-                    calibrated_params[key] = val
+            # 軽量化：基準値処理を簡素化
+            calibrated_params = raw_params
             
             # スムージング適用
             smoothed_params = self.smooth_params(calibrated_params)
@@ -849,15 +1299,16 @@ class FacialTracker:
             left_y = 60
             right_y = 60
             
-            # 無効化されたパラメータリスト
+            # 無効化されたパラメータリスト（軽量化：大部分を無効化）
             disabled_params = {
-                'JawForward',  # 顎前方（動作しないため削除）
+                'JawForward',  # 顎前方
                 'CheekPuffRight', 'CheekPuffLeft',  # 頬膨らみ
                 'TongueOut', 'TongueUp', 'TongueDown', 'TongueRight', 'TongueLeft',  # 舌
                 'EyesX', 'EyesY', 'LeftEyeLid', 'RightEyeLid', 'EyesWiden',  # 目
                 'EyeSquintLeft', 'EyeSquintRight', 'EyeWideLeft', 'EyeWideRight',  # 目
                 'BrowInnerUpLeft', 'BrowInnerUpRight', 'BrowLowererLeft', 'BrowLowererRight',  # 眉毛
-                'BrowOuterUpLeft', 'BrowOuterUpRight'  # 眉毛
+                'BrowOuterUpLeft', 'BrowOuterUpRight',  # 眉毛
+                'NoseSneerLeft', 'NoseSneerRight'  # 鼻（軽量化のため無効化）
             }
             
             # パラメータを2列に分けて表示（動作するもののみ）
@@ -879,65 +1330,17 @@ class FacialTracker:
                     param_count += 1
             
             # システム状態表示（上部中央）
-            cv2.putText(frame, f"Face Tracking: WORKING (Mouth/Jaw Only)", (w//2 - 180, 35),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(frame, f"VR Face Tracking: Lightweight Mode (Jaw Focus)", (w//2 - 200, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
-            # 口のランドマークを描画（デバッグ用）
+            # 軽量化：最小限のデバッグ表示
+            # 主要な口のポイントのみ表示
             mouth_points = []
-            for idx in [61, 291, 13, 14, 17]:  # 主要な口のポイント
+            for idx in [61, 291, 13, 14, 18]:  # 左口角、右口角、上唇、下唇、顎先
                 x = int(landmarks[idx].x * w)
                 y = int(landmarks[idx].y * h)
                 cv2.circle(frame, (x, y), 2, (0, 255, 255), -1)
                 mouth_points.append((x, y))
-            
-            # 鼻のランドマークを描画（デバッグ用）
-            nose_points = [219, 439, 2]  # 左鼻翼、右鼻翼、鼻中央
-            for idx in nose_points:
-                x = int(landmarks[idx].x * w)
-                y = int(landmarks[idx].y * h)
-                color = (255, 0, 255) if idx == 2 else (0, 255, 0)  # 中央は紫、翼は緑
-                cv2.circle(frame, (x, y), 3, color, -1)
-            
-            # 鼻のデバッグ情報を表示
-            if hasattr(self, 'nose_debug_info'):
-                debug_info = self.nose_debug_info
-                debug_y = h - 150
-                cv2.putText(frame, f"Nose Debug:", (10, debug_y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, f"L: {debug_info['left_change']:.3f} ({debug_info['left_ratio']:.3f})", (10, debug_y + 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                cv2.putText(frame, f"R: {debug_info['right_change']:.3f} ({debug_info['right_ratio']:.3f})", (10, debug_y + 40),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                cv2.putText(frame, f"Face W: {debug_info['face_width']:.3f}", (10, debug_y + 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-            
-            # 3D姿勢情報を表示
-            pose_3d = self.get_3d_pose(landmarks, w, h)
-            if pose_3d['success']:
-                euler = pose_3d['euler_angles']
-                cv2.putText(frame, f"3D Pose: Y:{math.degrees(euler['yaw']):.1f}° P:{math.degrees(euler['pitch']):.1f}° R:{math.degrees(euler['roll']):.1f}°", 
-                           (w - 400, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                cv2.putText(frame, "3D POSE ACTIVE", (w - 150, 50),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            else:
-                cv2.putText(frame, "3D POSE FAILED", (w - 150, 50),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            
-            # 光学フロー状態表示
-            if hasattr(self, 'prev_gray') and self.prev_gray is not None:
-                cv2.putText(frame, "OPTICAL FLOW ACTIVE", (w - 200, 70),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            else:
-                cv2.putText(frame, "OPTICAL FLOW INIT", (w - 200, 70),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-            
-            # 全体的なスケール情報を表示
-            if hasattr(self, 'last_scale_info'):
-                scale_info = self.last_scale_info
-                cv2.putText(frame, f"Scale Factor: {scale_info['factor']:.2f}", (w - 200, 90),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, f"Face Scale: {scale_info['scale']:.1f}px", (w - 200, 110),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             # 有効なパラメータのみデバッグ表示（青い文字）
             blue_color = (255, 0, 0)  # BGRなので青は(255,0,0)
@@ -958,9 +1361,34 @@ class FacialTracker:
                 cv2.putText(frame, f"Jaw Offset: {mouth_params.get('jaw_offset', 0):.3f} (L/R sensitivity: 7.0/8.0)", (10, h - 120),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, blue_color, 1)
             
-            # 無効化されたパラメータの表示
-            cv2.putText(frame, f"DISABLED: JawForward, Eyes, CheekPuff, Tongue", (10, h - 100),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)  # 赤色で表示
+            # 舌のデバッグ情報を表示
+            if hasattr(self, 'tongue_debug_info'):
+                tongue_info = self.tongue_debug_info
+                debug_y = h - 220
+                cv2.putText(frame, f"TONGUE DEBUG:", (w//2, debug_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                cv2.putText(frame, f"Open: {tongue_info['mouth_open']} Ratio: {tongue_info['mouth_ratio']:.3f}", (w//2, debug_y + 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                cv2.putText(frame, f"X: {tongue_info['x_offset']:.3f} Prot: {tongue_info['protrusion_raw']:.3f}", (w//2, debug_y + 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                cv2.putText(frame, f"Up: {tongue_info['up_distance']:.3f} Down: {tongue_info['down_distance']:.3f}", (w//2, debug_y + 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+            
+            # 頬のデバッグ情報を表示
+            if hasattr(self, 'cheek_debug_info'):
+                cheek_info = self.cheek_debug_info
+                debug_y = h - 140
+                cv2.putText(frame, f"CHEEK DEBUG:", (w//2, debug_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(frame, f"L Exp: {cheek_info['left_expansion_ratio']:.3f} R Exp: {cheek_info['right_expansion_ratio']:.3f}", (w//2, debug_y + 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                cv2.putText(frame, f"L Puff: {cheek_info['left_puff_final']:.3f} R Puff: {cheek_info['right_puff_final']:.3f}", (w//2, debug_y + 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            
+            # カメラ使用状況の表示
+            camera_info = "Dual Camera Active" if (self.dual_camera and hasattr(self, 'secondary_landmarks')) else "Single Camera Mode"
+            cv2.putText(frame, f"Camera: {camera_info}", (10, h - 100),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             
             # 口の輪郭線を描画
             if len(mouth_points) >= 4:
@@ -968,79 +1396,485 @@ class FacialTracker:
                 cv2.line(frame, mouth_points[2], mouth_points[3], (255, 0, 0), 1)  # 縦線
         
         else:
-            cv2.putText(frame, "No face detected", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        
+            # 顔検出失敗時のメッセージ
+            h, w, _ = frame.shape
+            frame = self.put_japanese_text(frame, "顔が検出できません", (10, 60), self.font_large, (0, 0, 255))
+            frame = self.put_japanese_text(frame, "対処:", (10, h - 100), self.font, (0, 255, 255))
+            frame = self.put_japanese_text(frame, "1. カメラを口周辺（鼻下〜顎）に向けてください", (10, h - 70), self.font_small, (255, 255, 255))
+            frame = self.put_japanese_text(frame, "2. 照明を明るくしてください", (10, h - 45), self.font_small, (255, 255, 255))
+
         return frame
 
+    def extract_mouth_roi(self, frame, landmarks, w, h, padding=50):
+        """
+        口周辺のROI（関心領域）を抽出
+        VRゴーグル着用時は目を含まず、口周辺のみを処理
+        """
+        try:
+            # 口周辺の主要ポイント
+            mouth_points = []
+            # 口角
+            mouth_points.append((landmarks[61].x * w, landmarks[61].y * h))   # 左口角
+            mouth_points.append((landmarks[291].x * w, landmarks[291].y * h)) # 右口角
+            # 上下唇
+            mouth_points.append((landmarks[0].x * w, landmarks[0].y * h))     # 上唇上部
+            mouth_points.append((landmarks[17].x * w, landmarks[17].y * h))   # 下唇下部
+            # 顎
+            mouth_points.append((landmarks[18].x * w, landmarks[18].y * h))   # 顎先
+
+            # バウンディングボックスを計算
+            x_coords = [p[0] for p in mouth_points]
+            y_coords = [p[1] for p in mouth_points]
+
+            min_x = max(0, int(min(x_coords) - padding))
+            max_x = min(w, int(max(x_coords) + padding))
+            min_y = max(0, int(min(y_coords) - padding))
+            max_y = min(h, int(max(y_coords) + padding))
+
+            # ROIを抽出
+            roi = frame[min_y:max_y, min_x:max_x]
+
+            return roi, (min_x, min_y, max_x, max_y)
+
+        except (IndexError, AttributeError):
+            return frame, (0, 0, w, h)
+
+class CameraSelector:
+    """カメラ選択とコントロール用のGUIクラス"""
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("VR Facial Tracking - Camera Selector")
+        self.root.geometry("400x200")
+
+        self.selected_camera = None
+        self.is_running = False
+        self.tracker = None
+        self.cap = None
+        self.tracking_thread = None  # スレッド管理用
+        self.cleanup_done = False  # クリーンアップ完了フラグ（重複防止）
+
+        # 利用可能なカメラを検出
+        self.available_cameras = detect_available_cameras()
+
+        # UI構築
+        self.build_ui()
+
+        # クリーンアップハンドラーを登録
+        atexit.register(self.cleanup)
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+        # GUIウィンドウを閉じる時のハンドラー（最重要）
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def on_closing(self):
+        """GUIウィンドウを閉じる時の処理"""
+        print("\nウィンドウを閉じています...")
+
+        # トラッキングを停止
+        self.is_running = False
+
+        # クリーンアップ
+        self.cleanup()
+
+        # GUIを破棄
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except:
+            pass
+
+        # プロセスを完全に終了
+        print("プロセスを終了します")
+        sys.exit(0)
+
+    def build_ui(self):
+        """UIを構築"""
+        # タイトル
+        title_label = tk.Label(self.root, text="VR Facial Tracking", font=("Arial", 16, "bold"))
+        title_label.pack(pady=10)
+
+        # カメラ選択フレーム
+        camera_frame = tk.Frame(self.root)
+        camera_frame.pack(pady=10)
+
+        tk.Label(camera_frame, text="カメラを選択:").pack(side=tk.LEFT, padx=5)
+
+        # カメラ選択ドロップダウン
+        self.camera_var = tk.StringVar()
+        if self.available_cameras:
+            self.camera_var.set(f"Camera {self.available_cameras[0]}")
+
+        camera_options = [f"Camera {i}" for i in self.available_cameras]
+        self.camera_dropdown = ttk.Combobox(camera_frame, textvariable=self.camera_var,
+                                           values=camera_options, state="readonly", width=15)
+        self.camera_dropdown.pack(side=tk.LEFT, padx=5)
+
+        # スタート/ストップボタンフレーム
+        button_frame = tk.Frame(self.root)
+        button_frame.pack(pady=20)
+
+        self.start_button = tk.Button(button_frame, text="スタート", command=self.start_tracking,
+                                      bg="#4CAF50", fg="white", font=("Arial", 12, "bold"),
+                                      width=10, height=2)
+        self.start_button.pack(side=tk.LEFT, padx=10)
+
+        self.stop_button = tk.Button(button_frame, text="ストップ", command=self.stop_tracking,
+                                     bg="#f44336", fg="white", font=("Arial", 12, "bold"),
+                                     width=10, height=2, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=10)
+
+        # 緊急停止ボタン
+        self.emergency_button = tk.Button(button_frame, text="緊急停止", command=self.emergency_stop,
+                                         bg="#ff0000", fg="white", font=("Arial", 10, "bold"),
+                                         width=8, height=2)
+        self.emergency_button.pack(side=tk.LEFT, padx=10)
+
+        # ステータスラベル
+        self.status_label = tk.Label(self.root, text="準備完了", fg="blue")
+        self.status_label.pack(pady=10)
+
+    def start_tracking(self):
+        """トラッキングを開始"""
+        if not self.available_cameras:
+            self.status_label.config(text="カメラが見つかりません", fg="red")
+            return
+
+        # 選択されたカメラのインデックスを取得
+        camera_text = self.camera_var.get()
+        camera_index = int(camera_text.split()[1])
+
+        self.selected_camera = camera_index
+        self.is_running = True
+
+        # ボタンの状態を更新
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.camera_dropdown.config(state=tk.DISABLED)
+
+        self.status_label.config(text=f"Camera {camera_index} で実行中...", fg="green")
+
+        # トラッキングを別スレッドで開始（非デーモン）
+        self.tracking_thread = threading.Thread(target=self.run_tracking, daemon=False)
+        self.tracking_thread.start()
+
+    def stop_tracking(self):
+        """トラッキングを停止"""
+        print("\n停止ボタンが押されました")
+        self.is_running = False
+
+        # クリーンアップを実行（スレッド終了を待ってから）
+        if self.tracking_thread is not None and self.tracking_thread.is_alive():
+            print("スレッドの終了を待機中...")
+            self.tracking_thread.join(timeout=3.0)
+
+        # リソース解放
+        self.cleanup()
+
+        # ボタンの状態を更新
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.camera_dropdown.config(state="readonly")
+        self.status_label.config(text="停止しました", fg="blue")
+
+    def emergency_stop(self):
+        """緊急停止: すべてのカメラリソースを即座に解放"""
+        print("\n=== 緊急停止 ===")
+
+        # 共通のクリーンアップ処理を呼び出す
+        self.cleanup()
+
+        # UIを更新
+        try:
+            self.start_button.config(state=tk.NORMAL)
+            self.stop_button.config(state=tk.DISABLED)
+            self.camera_dropdown.config(state="readonly")
+            self.status_label.config(text="緊急停止しました", fg="red")
+        except:
+            pass
+
+    def cleanup(self):
+        """アプリケーション終了時のクリーンアップ（1回のみ実行）"""
+        # 重複実行を防止
+        if self.cleanup_done:
+            return
+
+        self.cleanup_done = True
+        print("\n=== クリーンアップ開始 ===")
+
+        # トラッキングを停止
+        self.is_running = False
+
+        # OSCクライアントをクリーンアップ（最初に実行）
+        if self.tracker is not None and hasattr(self.tracker, 'osc_client'):
+            try:
+                print("1. OSCパラメータをリセット...")
+                for param_name in PARAMS.keys():
+                    self.tracker.osc_client.send_message(PARAMS[param_name], 0.0)
+            except Exception as e:
+                print(f"   OSCリセットエラー: {e}")
+
+        # MediaPipeリソースを明示的に解放
+        if self.tracker is not None and hasattr(self.tracker, 'face_mesh'):
+            try:
+                print("2. MediaPipe解放中...")
+                self.tracker.face_mesh.close()
+            except Exception as e:
+                print(f"   MediaPipe解放エラー: {e}")
+
+        # OpenCVウィンドウを閉じる（カメラ解放の前）
+        try:
+            print("3. OpenCVウィンドウを閉じる...")
+            cv2.destroyAllWindows()
+        except Exception as e:
+            print(f"   ウィンドウクローズエラー: {e}")
+
+        # カメラを解放（最も重要・1回だけ）
+        if self.cap is not None:
+            try:
+                print("4. カメラ解放中...")
+                # capをローカル変数に移動してから解放
+                cap_to_release = self.cap
+                self.cap = None  # 先にNoneにして二重解放を防ぐ
+                cap_to_release.release()
+                del cap_to_release
+                print("   カメラ解放完了")
+            except Exception as e:
+                print(f"   カメラ解放エラー: {e}")
+                self.cap = None
+
+        # 最後にtrackerをNoneに設定
+        self.tracker = None
+
+        print("=== クリーンアップ完了 ===\n")
+
+    def signal_handler(self, sig, frame):
+        """シグナルハンドラー（Ctrl+C対応）"""
+        print("\n\nCtrl+Cが検出されました。安全に終了します...")
+
+        # クリーンアップ
+        self.cleanup()
+
+        # GUIを閉じる
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except:
+            pass
+
+        print("終了しました")
+        sys.exit(0)
+
+    def run_tracking(self):
+        """トラッキングループを実行"""
+        try:
+            # トラッカー初期化
+            self.tracker = FacialTracker(dual_camera=False)
+
+            # カメラを開く
+            self.cap = cv2.VideoCapture(self.selected_camera, cv2.CAP_DSHOW)
+
+            if not self.cap.isOpened():
+                # カメラが開けなかった場合、capを解放してからreturn
+                cap_failed = self.cap
+                self.cap = None
+                cap_failed.release()
+                del cap_failed
+                self.root.after(0, lambda: self.status_label.config(text="カメラを開けませんでした", fg="red"))
+                self.is_running = False
+                return
+
+            # カメラ設定（超低負荷）
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)  # 640→320（さらに軽量化）
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)  # 480→240
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+            self.cap.set(cv2.CAP_PROP_FOCUS, 0)
+
+            window_name = 'VR Facial Tracking'
+            cv2.namedWindow(window_name)
+
+            # マウスコールバックを設定（ボタンクリック用）
+            def mouse_callback(event, x, y, flags, param):
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    button_clicked = self.tracker.check_button_click(x, y)
+                    if button_clicked == 'calibrate':
+                        self.tracker.calibration_needed = True
+                        self.tracker.calibration_frames = 0
+                        self.tracker.baseline = {}
+                        # 全バッファをクリア
+                        if hasattr(self.tracker, 'jaw_baseline_buffer'):
+                            delattr(self.tracker, 'jaw_baseline_buffer')
+                        if hasattr(self.tracker, 'corner_baseline_buffer'):
+                            delattr(self.tracker, 'corner_baseline_buffer')
+                        if hasattr(self.tracker, 'jaw_open_baseline'):
+                            delattr(self.tracker, 'jaw_open_baseline')
+                        if hasattr(self.tracker, 'baseline_left_corner_y'):
+                            delattr(self.tracker, 'baseline_left_corner_y')
+                            delattr(self.tracker, 'baseline_right_corner_y')
+                        print("キャリブレーション開始...")
+                    elif button_clicked == 'reset':
+                        self.tracker.calibration_needed = True
+                        self.tracker.calibration_frames = 0
+                        self.tracker.baseline = {}
+                        # 全バッファをクリア
+                        if hasattr(self.tracker, 'jaw_baseline_buffer'):
+                            delattr(self.tracker, 'jaw_baseline_buffer')
+                        if hasattr(self.tracker, 'corner_baseline_buffer'):
+                            delattr(self.tracker, 'corner_baseline_buffer')
+                        if hasattr(self.tracker, 'jaw_open_baseline'):
+                            delattr(self.tracker, 'jaw_open_baseline')
+                        if hasattr(self.tracker, 'baseline_left_corner_y'):
+                            delattr(self.tracker, 'baseline_left_corner_y')
+                            delattr(self.tracker, 'baseline_right_corner_y')
+                        print("リセット...")
+                    elif button_clicked == 'switch_camera':
+                        print("カメラ切り替えは起動時のGUIから行ってください")
+
+            cv2.setMouseCallback(window_name, mouse_callback)
+
+            frame_count = 0
+            import time
+            frame_time_target = 1.0 / 30.0  # 30fps制限
+
+            while self.is_running:
+                frame_start = time.time()
+
+                ret, frame = self.cap.read()
+                if not ret:
+                    break
+
+                # 水平反転（鏡像）
+                frame = cv2.flip(frame, 1)
+
+                # トラッキング処理（毎フレーム実行）
+                frame = self.tracker.process_frame(frame)
+
+                # コントロール用のテキストを追加
+                h, w, _ = frame.shape
+                cv2.putText(frame, "'q': Quit | 'c': Calibrate | 'r': Reset | 'ESC': Emergency Stop", (10, h - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+                cv2.imshow(window_name, frame)
+
+                # FPS制限（CPU負荷軽減）
+                frame_elapsed = time.time() - frame_start
+                sleep_time = max(0, frame_time_target - frame_elapsed)
+                key = cv2.waitKey(max(1, int(sleep_time * 1000))) & 0xFF
+                if key == ord('q'):
+                    self.is_running = False
+                elif key == 27:  # ESCキー
+                    print("\n⚠⚠⚠ ESCキーで緊急停止 ⚠⚠⚠")
+                    self.is_running = False
+                    # リソース解放はcleanup()で行う（二重解放を防ぐ）
+                    self.root.after(0, lambda: self.status_label.config(text="緊急停止しました", fg="red"))
+                    break
+                elif key == ord('r'):
+                    self.tracker.calibration_needed = True
+                    self.tracker.calibration_frames = 0
+                    self.tracker.baseline = {}
+                    # 全バッファをクリア
+                    if hasattr(self.tracker, 'jaw_baseline_buffer'):
+                        delattr(self.tracker, 'jaw_baseline_buffer')
+                    if hasattr(self.tracker, 'corner_baseline_buffer'):
+                        delattr(self.tracker, 'corner_baseline_buffer')
+                    if hasattr(self.tracker, 'jaw_open_baseline'):
+                        delattr(self.tracker, 'jaw_open_baseline')
+                    if hasattr(self.tracker, 'baseline_left_corner_y'):
+                        delattr(self.tracker, 'baseline_left_corner_y')
+                        delattr(self.tracker, 'baseline_right_corner_y')
+                elif key == ord('c'):
+                    self.tracker.calibration_needed = True
+                    self.tracker.calibration_frames = 0
+                    self.tracker.baseline = {}
+                    # 全バッファをクリア
+                    if hasattr(self.tracker, 'jaw_baseline_buffer'):
+                        delattr(self.tracker, 'jaw_baseline_buffer')
+                    if hasattr(self.tracker, 'corner_baseline_buffer'):
+                        delattr(self.tracker, 'corner_baseline_buffer')
+                    if hasattr(self.tracker, 'jaw_open_baseline'):
+                        delattr(self.tracker, 'jaw_open_baseline')
+                    if hasattr(self.tracker, 'baseline_left_corner_y'):
+                        delattr(self.tracker, 'baseline_left_corner_y')
+                        delattr(self.tracker, 'baseline_right_corner_y')
+
+        finally:
+            # トラッキングスレッド終了
+            # 重要: リソース解放は一切しない（cleanup()で行う）
+            print("\nトラッキングスレッド終了")
+
+            # UIのみ更新（リソース解放はcleanup()に任せる）
+            try:
+                self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.stop_button.config(state=tk.DISABLED))
+                self.root.after(0, lambda: self.camera_dropdown.config(state="readonly"))
+                self.root.after(0, lambda: self.status_label.config(text="停止しました", fg="blue"))
+            except:
+                pass
+
+    def run(self):
+        """GUIのメインループを開始"""
+        self.root.mainloop()
+
+def detect_available_cameras():
+    """
+    安全なカメラ検出（Varjo競合対策版）
+
+    重要: カメラを一切開かない
+    デバイス名のリストだけを取得
+    """
+    print("\nカメラ検出中（デバイスを開きません）...")
+
+    # pygrabberが必須
+    if not PYGRABBER_AVAILABLE:
+        print("=" * 60)
+        print("エラー: pygrabberが利用できません")
+        print("=" * 60)
+        print("以下のコマンドを実行してインストールしてください:")
+        print("  pip install pygrabber")
+        print("")
+        print("pygrabberなしではWindowsデバイスマネージャーの")
+        print("安全性を保証できないため、起動を中止します。")
+        print("=" * 60)
+        return []
+
+    # pygrabberでデバイスリストを取得（カメラを一切開かない）
+    try:
+        graph = FilterGraph()
+        devices = graph.get_input_devices()
+
+        available_cameras = []
+        varjo_keywords = ['varjo', 'eye', 'tracking', 'gaze']
+
+        print("\n利用可能なカメラデバイス:")
+        for i, device_name in enumerate(devices):
+            # Varjoカメラをスキップ
+            is_varjo = any(keyword in device_name.lower() for keyword in varjo_keywords)
+
+            if is_varjo:
+                print(f"  [{i}] {device_name} - Varjo（スキップ）")
+                continue
+
+            # カメラを開かずにリストに追加
+            available_cameras.append(i)
+            print(f"  [{i}] {device_name}")
+
+        print(f"\n検出完了: {len(available_cameras)} 個のカメラ")
+        print("注意: カメラは「スタート」ボタンを押すまで開きません\n")
+
+        return available_cameras
+
+    except Exception as e:
+        print(f"エラー: カメラ検出に失敗 - {e}")
+        return []
+
 def main():
-    print("Initializing facial tracker...")
-    tracker = FacialTracker()
-    
-    print("Opening camera...")
-    cap = cv2.VideoCapture(0)
-    
-    if not cap.isOpened():
-        print("Error: Cannot open camera")
-        return
-    
-    # カメラ設定 - より大きなプレビュー + VR近距離用オートフォーカス
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    
-    # VR近距離撮影用のフォーカス設定
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # オートフォーカス有効
-    cap.set(cv2.CAP_PROP_FOCUS, 0)      # 最小フォーカス距離に設定
-    
-    print("Camera opened successfully!")
-    print("Press 'r' to recalibrate, 'c' to calibrate, 'a' to toggle eye tracking, 'q' to quit")
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Cannot read frame from camera")
-            break
-        
-        # 水平反転（鏡像）
-        frame = cv2.flip(frame, 1)
-        
-        # トラッキング処理
-        frame = tracker.process_frame(frame)
-        
-        # コントロール用のテキストを追加（右下に配置して重複回避）
-        h, w, _ = frame.shape
-        help_x = w - 400
-        cv2.putText(frame, "Controls:", (help_x, h - 70),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "'c': Calibrate | 'r': Reset | 'a': Eye tracking | 'q': Quit", (help_x, h - 50),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        
-        cv2.imshow('VRChat Facial OSC Tracking - Fixed', frame)
-        
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('r'):
-            # キャリブレーションリセット
-            tracker.calibration_needed = True
-            tracker.calibration_frames = 0
-            tracker.baseline = {}
-            print("Calibration reset...")
-        elif key == ord('c'):
-            # 手動キャリブレーション開始
-            tracker.calibration_needed = True
-            tracker.calibration_frames = 0
-            tracker.baseline = {}
-            print("Starting calibration... Keep face in neutral position for 2 seconds")
-        elif key == ord('a'):
-            # アイトラッキング切り替え
-            tracker.eye_tracking_enabled = not tracker.eye_tracking_enabled
-            status = "enabled" if tracker.eye_tracking_enabled else "disabled"
-            print(f"Eye tracking {status}")
-    
-    cap.release()
-    cv2.destroyAllWindows()
+    """VR Facial Tracking - 起動"""
+    print("VR Facial Tracking 起動中...")
+
+    # GUIを起動
+    app = CameraSelector()
+    app.run()
 
 if __name__ == "__main__":
     main()
